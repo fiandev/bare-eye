@@ -11,6 +11,7 @@ import (
 	ui "github.com/metaspartan/gotui/v5"
 	"github.com/metaspartan/gotui/v5/widgets"
 
+	"github.com/fiandev/bare-eye/internal/agent"
 	"github.com/fiandev/bare-eye/internal/config"
 	"github.com/fiandev/bare-eye/internal/keys"
 	"github.com/fiandev/bare-eye/internal/scheduler"
@@ -19,6 +20,11 @@ import (
 )
 
 type mode int
+
+// DefaultRenderTick is how often the dashboard repaints by default. It is
+// independent of the SSH collection interval, which decides how often new
+// samples (chart points) arrive. It can be overridden with --tick.
+const DefaultRenderTick = 100 * time.Millisecond
 
 const (
 	modeOverview mode = iota
@@ -29,6 +35,8 @@ const (
 	modeFilter
 	modeKeyInfo
 	modePassword
+	modeAgentInput
+	modeAgentLog
 )
 
 type asyncResult struct {
@@ -44,6 +52,7 @@ type confirmState struct {
 	title   string
 	message string
 	onYes   func()
+	onNo    func()
 }
 
 type passwordState struct {
@@ -51,6 +60,11 @@ type passwordState struct {
 	srv    config.ServerConfig
 	value  string
 	after  func(password string)
+}
+
+type agentApproval struct {
+	req agent.Approval
+	res chan bool
 }
 
 // App is the dashboard state machine.
@@ -68,10 +82,22 @@ type App struct {
 	filter   string
 	visible  []state.HostState
 
-	form     *formState
-	confirm  *confirmState
-	password *passwordState
-	overlay  string
+	form         *formState
+	confirm      *confirmState
+	password     *passwordState
+	overlay      string
+	overlayTitle string
+
+	agentRunner     *agent.Runner
+	agentBusy       bool
+	agentCancel     context.CancelFunc
+	agentReturn     mode
+	agentEvents     chan agent.Event
+	agentApproval   chan agentApproval
+	pendingApproval *agentApproval
+	transcript      []string
+	agentScroll     int
+	lastReply       string
 
 	status   string
 	statusAt time.Time
@@ -80,23 +106,30 @@ type App struct {
 	quit          bool
 	dirtyClear    bool
 
-	header   *widgets.Paragraph
-	table    *widgets.Table
-	cpu      *widgets.Gauge
-	mem      *widgets.Gauge
-	swap     *widgets.Gauge
-	spark    *widgets.SparklineGroup
-	detail   *widgets.Paragraph
-	disk     *widgets.List
-	net      *widgets.Paragraph
-	eventLog *widgets.List
-	modal    *widgets.Paragraph
+	header    *widgets.Paragraph
+	table     *widgets.Table
+	cpu       *widgets.Gauge
+	mem       *widgets.Gauge
+	swap      *widgets.Gauge
+	spark     *axisChart
+	detail    *widgets.Paragraph
+	disk      *widgets.List
+	net       *widgets.Paragraph
+	netPlot   *axisChart
+	eventLog  *widgets.List
+	agentView *widgets.Paragraph
+	prompt    *widgets.Input
+	modal     *widgets.Paragraph
 
 	async chan asyncResult
 }
 
-// Run starts the dashboard and blocks until the user quits.
-func Run(cfg *config.Config, secrets *config.Secrets, store *state.Store, events *state.EventLog, sched *scheduler.Scheduler, version string) error {
+// Run starts the dashboard and blocks until the user quits. tick controls how
+// often the screen repaints; zero uses DefaultRenderTick.
+func Run(cfg *config.Config, secrets *config.Secrets, store *state.Store, events *state.EventLog, sched *scheduler.Scheduler, version string, tick time.Duration) error {
+	if tick <= 0 {
+		tick = DefaultRenderTick
+	}
 	if err := ui.Init(); err != nil {
 		return fmt.Errorf("initialize terminal UI: %w", err)
 	}
@@ -108,7 +141,7 @@ func Run(cfg *config.Config, secrets *config.Secrets, store *state.Store, events
 	a.refresh()
 	a.render()
 
-	ticker := time.NewTicker(250 * time.Millisecond)
+	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 	uiEvents := ui.PollEvents()
 
@@ -120,6 +153,14 @@ func Run(cfg *config.Config, secrets *config.Secrets, store *state.Store, events
 			a.refresh()
 		case r := <-a.async:
 			a.handleAsync(r)
+		case ev := <-a.agentEvents:
+			a.handleAgentEvent(ev)
+		case req := <-a.agentApproval:
+			if a.agentBusy {
+				a.showAgentApproval(req)
+			} else {
+				req.res <- false
+			}
 		}
 		if a.quit {
 			break
@@ -139,6 +180,9 @@ func newApp(cfg *config.Config, secrets *config.Secrets, store *state.Store, eve
 		version: version,
 		async:   make(chan asyncResult, 8),
 	}
+	a.agentEvents = make(chan agent.Event, 64)
+	a.agentApproval = make(chan agentApproval, 1)
+	a.agentRunner = agent.New(cfg, secrets, store)
 	a.header = widgets.NewParagraph()
 	a.header.Title = " Bare Eye "
 	a.header.TitleStyle = ui.NewStyle(ui.ColorCyan, ui.ColorClear, ui.ModifierBold)
@@ -167,8 +211,12 @@ func newApp(cfg *config.Config, secrets *config.Secrets, store *state.Store, eve
 	a.swap.BarColor = ui.ColorYellow
 	a.swap.BorderStyle = ui.NewStyle(ui.ColorLightGrey)
 
-	a.spark = widgets.NewSparklineGroup()
-	a.spark.Title = " Trends (CPU / Memory) "
+	a.spark = newAxisChart()
+	a.spark.Title = " Trends · CPU % (green) / MEM % (cyan) "
+	a.spark.TitleBottom = " Y axis: percent (0–100%) "
+	a.spark.YFormat = percentAxisLabel
+	a.spark.MaxVal = 100
+	a.spark.EmptyMsg = " waiting for samples…"
 	a.spark.BorderStyle = ui.NewStyle(ui.ColorLightGrey)
 
 	a.detail = widgets.NewParagraph()
@@ -184,9 +232,28 @@ func newApp(cfg *config.Config, secrets *config.Secrets, store *state.Store, eve
 	a.net.Title = " Network & System "
 	a.net.BorderStyle = ui.NewStyle(ui.ColorLightGrey)
 
+	a.netPlot = newAxisChart()
+	a.netPlot.Title = " Network rate "
+	a.netPlot.TitleBottom = " RX green · TX yellow · Y axis: bytes per second "
+	a.netPlot.YFormat = humanRate
+	a.netPlot.BorderStyle = ui.NewStyle(ui.ColorLightGrey)
+	a.netPlot.EmptyMsg = " waiting for the next sample…"
+
 	a.eventLog = widgets.NewList()
 	a.eventLog.Title = " Recent Events (· info  ! warn  × error) "
 	a.eventLog.BorderStyle = ui.NewStyle(ui.ColorLightGrey)
+
+	a.agentView = widgets.NewParagraph()
+	a.agentView.Title = " Agent response · Ctrl+A transcript "
+	a.agentView.BorderStyle = ui.NewStyle(ui.ColorLightGrey)
+	a.agentView.WrapText = true
+
+	a.prompt = widgets.NewInput()
+	a.prompt.Title = " Agent "
+	a.prompt.TextStyle = ui.NewStyle(ui.ColorWhite)
+	a.prompt.CursorStyle = ui.NewStyle(ui.ColorBlack, ui.ColorCyan)
+	a.prompt.BorderStyle = ui.NewStyle(ui.ColorLightGrey)
+	a.prompt.Placeholder = "Describe a VPS setup task…   ( : to focus · Ctrl+A transcript )"
 
 	a.modal = widgets.NewParagraph()
 	a.modal.BorderStyle = ui.NewStyle(ui.ColorCyan)
@@ -194,6 +261,36 @@ func newApp(cfg *config.Config, secrets *config.Secrets, store *state.Store, eve
 
 	a.selected = 0
 	return a
+}
+
+func (a *App) quitApp() {
+	if a.agentCancel != nil {
+		a.agentCancel()
+		a.agentCancel = nil
+	}
+	a.quit = true
+}
+
+func (a *App) cancelAgent() {
+	if a.agentCancel == nil {
+		return
+	}
+	a.agentCancel()
+	a.agentCancel = nil
+	a.agentBusy = false
+	if a.pendingApproval != nil {
+		select {
+		case a.pendingApproval.res <- false:
+		default:
+		}
+		a.pendingApproval = nil
+	}
+	if a.mode == modeConfirm {
+		a.confirm = nil
+		a.setMode(modeOverview)
+	}
+	a.agentLine("× cancelled by operator")
+	a.setStatus("agent cancelled")
 }
 
 func (a *App) setStatus(format string, args ...any) {
@@ -216,7 +313,11 @@ func (a *App) handleEvent(e ui.Event) {
 		return
 	}
 	if e.ID == "<C-c>" {
-		a.quit = true
+		a.quitApp()
+		return
+	}
+	if e.ID == "<C-x>" && a.agentBusy {
+		a.cancelAgent()
 		return
 	}
 	switch a.mode {
@@ -230,6 +331,10 @@ func (a *App) handleEvent(e ui.Event) {
 		a.setMode(modeOverview)
 	case modePassword:
 		a.handlePasswordKey(e.ID)
+	case modeAgentInput:
+		a.handleAgentInputKey(e.ID)
+	case modeAgentLog:
+		a.handleAgentLogKey(e.ID)
 	case modeDetail:
 		a.handleDetailKey(e.ID)
 	default:
@@ -240,7 +345,7 @@ func (a *App) handleEvent(e ui.Event) {
 func (a *App) handleOverviewKey(id string) {
 	switch id {
 	case "q":
-		a.quit = true
+		a.quitApp()
 	case "?":
 		a.showHelp()
 	case "<Up>", "k":
@@ -280,6 +385,10 @@ func (a *App) handleOverviewKey(id string) {
 	case "/":
 		a.mode = modeFilter
 		a.dirtyClear = true
+	case ":":
+		a.focusAgent()
+	case "<C-a>":
+		a.openAgentLog()
 	case "K":
 		a.showKeyInfo()
 	}
@@ -288,7 +397,7 @@ func (a *App) handleOverviewKey(id string) {
 func (a *App) handleDetailKey(id string) {
 	switch id {
 	case "q":
-		a.quit = true
+		a.quitApp()
 	case "<Escape>", "<Enter>", "h":
 		a.setMode(modeOverview)
 	case "?":
@@ -307,6 +416,10 @@ func (a *App) handleDetailKey(id string) {
 			a.sched.Reconnect(srv.ID)
 			a.setStatus("reconnecting %s…", srv.DisplayName())
 		}
+	case ":":
+		a.focusAgent()
+	case "<C-a>":
+		a.openAgentLog()
 	}
 }
 
@@ -330,20 +443,292 @@ func (a *App) handleFilterKey(id string) {
 	}
 }
 
-func (a *App) handleConfirmKey(id string) {
-	switch strings.ToLower(id) {
-	case "y":
-		if a.confirm != nil && a.confirm.onYes != nil {
-			fn := a.confirm.onYes
-			a.confirm = nil
-			a.setMode(modeOverview)
-			fn()
+// aiEnabled reports whether the agent UI (input and response panels) is on.
+func (a *App) aiEnabled() bool {
+	return a.cfg != nil && a.cfg.AI.Enabled
+}
+
+func (a *App) focusAgent() {
+	if !a.aiEnabled() {
+		a.showAgentDisabled()
+		return
+	}
+	if a.mode != modeAgentInput {
+		a.agentReturn = a.mode
+	}
+	a.setMode(modeAgentInput)
+}
+
+// showAgentDisabled explains how to turn the agent back on when ':' is pressed.
+func (a *App) showAgentDisabled() {
+	a.overlayTitle = " AI agent is off "
+	a.overlay = "\n  The AI agent is disabled in config.yaml.\n\n  Enable it with:\n    bare-eye config ai on\n\n  then restart bare-eye. The agent input and response panels will\n  appear once it is enabled.\n"
+	a.setMode(modeHelp)
+}
+
+func (a *App) handleAgentInputKey(id string) {
+	switch id {
+	case "<Escape>":
+		a.setMode(a.agentReturn)
+	case "<Enter>":
+		text := a.prompt.Text
+		if strings.TrimSpace(text) == "" {
 			return
 		}
-		fallthrough
-	case "n", "<Escape>", "<Enter>":
+		if a.agentBusy {
+			a.setStatus("agent is already running; wait for it to finish")
+			return
+		}
+		a.prompt.Text = ""
+		a.prompt.Cursor = 0
+		a.setMode(a.agentReturn)
+		a.submitAgent(text)
+	case "<Backspace>":
+		a.prompt.Backspace()
+	case "<Left>":
+		a.prompt.MoveCursorLeft()
+	case "<Right>":
+		a.prompt.MoveCursorRight()
+	case "<Home>":
+		a.prompt.Cursor = 0
+	case "<End>":
+		a.prompt.Cursor = len([]rune(a.prompt.Text))
+	case "<C-u>":
+		a.prompt.Text = ""
+		a.prompt.Cursor = 0
+	case "<C-a>":
+		a.openAgentLog()
+	default:
+		if r := []rune(id); len(r) == 1 {
+			a.prompt.InsertRune(r[0])
+		}
+	}
+}
+
+func (a *App) openAgentLog() {
+	if !a.aiEnabled() {
+		a.showAgentDisabled()
+		return
+	}
+	if a.mode != modeAgentLog {
+		a.agentReturn = a.mode
+	}
+	a.agentScroll = 0
+	a.setMode(modeAgentLog)
+}
+
+func (a *App) handleAgentLogKey(id string) {
+	switch id {
+	case "<Escape>", "q":
+		a.setMode(a.agentReturn)
+	case "<Up>", "k":
+		a.agentScroll++
+	case "<Down>", "j":
+		a.agentScroll--
+	case "<PgUp>":
+		a.agentScroll += 10
+	case "<PgDown>":
+		a.agentScroll -= 10
+	case "g":
+		a.agentScroll = len(a.transcript)
+	case "G":
+		a.agentScroll = 0
+	}
+	if a.agentScroll < 0 {
+		a.agentScroll = 0
+	}
+	if a.agentScroll > len(a.transcript) {
+		a.agentScroll = len(a.transcript)
+	}
+}
+
+func (a *App) submitAgent(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	if a.agentBusy {
+		a.setStatus("agent is already running; wait for it to finish")
+		return
+	}
+	if err := a.agentRunner.Ready(); err != nil {
+		a.overlay = agent.SetupHint(a.cfg.AI.BaseURL, a.cfg.AI.APIKeyEnv, a.cfg.AI.Model)
+		a.overlayTitle = " Agent setup "
+		a.setMode(modeHelp)
+		return
+	}
+	hint := ""
+	if srv := a.currentServer(); srv != nil {
+		hint = fmt.Sprintf("selected host = %s (%s)", srv.ID, srv.Addr())
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	a.agentBusy = true
+	a.agentCancel = cancel
+	a.agentScroll = 0
+	a.lastReply = ""
+	a.agentLine("you: %s", text)
+	a.events.Add(state.LevelInfo, "agent", "task: "+truncate(text, 80))
+	a.setStatus("agent: thinking…")
+	runner := a.snapshotRunner()
+	go func() {
+		defer cancel()
+		err := runner.Run(ctx, text, hint, agent.Callbacks{
+			Emit: func(ev agent.Event) {
+				select {
+				case a.agentEvents <- ev:
+				case <-ctx.Done():
+				}
+			},
+			Approve: func(ctx context.Context, req agent.Approval) bool {
+				res := make(chan bool, 1)
+				select {
+				case a.agentApproval <- agentApproval{req: req, res: res}:
+				case <-ctx.Done():
+					return false
+				}
+				select {
+				case ok := <-res:
+					return ok
+				case <-ctx.Done():
+					return false
+				}
+			},
+		})
+		ev := agent.Event{Kind: agent.EventDone}
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				ev.Kind = agent.EventInfo
+				ev.Text = "task cancelled"
+			} else {
+				ev.Kind = agent.EventError
+				ev.Text = err.Error()
+			}
+		}
+		select {
+		case a.agentEvents <- ev:
+		case <-ctx.Done():
+		}
+	}()
+}
+
+func (a *App) snapshotRunner() *agent.Runner {
+	cfg := *a.cfg
+	cfg.Servers = append([]config.ServerConfig(nil), a.cfg.Servers...)
+	var secrets *config.Secrets
+	if a.secrets != nil {
+		secrets = &config.Secrets{Passwords: make(map[string]string, len(a.secrets.Passwords))}
+		for k, v := range a.secrets.Passwords {
+			secrets.Passwords[k] = v
+		}
+	}
+	return agent.New(&cfg, secrets, a.store)
+}
+
+func (a *App) showAgentApproval(req agentApproval) {
+	a.pendingApproval = &req
+	a.setStatus("agent: waiting for approval on %s", req.req.Host)
+	plan := strings.TrimSpace(a.lastReply)
+	prefix := ""
+	if plan != "" {
+		prefix = "Agent: " + truncate(strings.ReplaceAll(plan, "\n", " "), 300) + "\n\n"
+	}
+	a.confirm = &confirmState{
+		title: " Agent · approve command ",
+		message: prefix + fmt.Sprintf("Host: %s\n\nPurpose: %s\n\nCommand:\n  %s\n\nRun this command on the server?",
+			req.req.Host, dash(req.req.Purpose), req.req.Command),
+		onYes: func() { req.res <- true },
+		onNo:  func() { req.res <- false },
+	}
+	a.setMode(modeConfirm)
+}
+
+func (a *App) handleAgentEvent(ev agent.Event) {
+	switch ev.Kind {
+	case agent.EventAssistant:
+		a.lastReply = ev.Text
+		a.agentBlock("assistant:", ev.Text)
+		a.events.Add(state.LevelInfo, "agent", truncate(firstLine(ev.Text), 90))
+		a.setStatus("agent: %s", truncate(firstLine(ev.Text), 70))
+	case agent.EventTool:
+		a.agentLine("→ %s  $ %s", ev.Host, ev.Command)
+		if strings.TrimSpace(ev.Text) != "" {
+			a.agentLine("   %s", ev.Text)
+		}
+		a.events.Add(state.LevelInfo, "agent", truncate(ev.Host+" $ "+ev.Command, 90))
+		a.setStatus("agent: running %s…", ev.Host)
+	case agent.EventResult:
+		a.agentBlock("   ←", ev.Text)
+		a.events.Add(state.LevelInfo, "agent", truncate(ev.Host+" result: "+firstLine(ev.Text), 90))
+	case agent.EventInfo:
+		a.agentLine("· %s", ev.Text)
+	case agent.EventError:
+		if strings.TrimSpace(a.lastReply) == "" {
+			a.lastReply = "Error: " + ev.Text
+		}
+		a.agentLine("× %s", ev.Text)
+		a.events.Add(state.LevelError, "agent", truncate(ev.Text, 90))
+		a.setStatus("agent error: %s", truncate(ev.Text, 80))
+		a.agentBusy = false
+		a.agentCancel = nil
+		a.pendingApproval = nil
+	case agent.EventDone:
+		a.agentBusy = false
+		a.agentCancel = nil
+		a.pendingApproval = nil
+		a.setStatus("agent: ready")
+	}
+}
+
+func (a *App) agentLine(format string, args ...any) {
+	line := time.Now().Format("15:04:05") + "  " + fmt.Sprintf(format, args...)
+	a.transcript = append(a.transcript, line)
+	if len(a.transcript) > 800 {
+		a.transcript = a.transcript[len(a.transcript)-800:]
+	}
+}
+
+func (a *App) agentBlock(prefix, text string) {
+	text = strings.TrimRight(text, "\n")
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	for i, line := range strings.Split(text, "\n") {
+		if i == 0 {
+			a.agentLine("%s %s", prefix, line)
+		} else {
+			a.agentLine("    %s", line)
+		}
+	}
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+func (a *App) handleConfirmKey(id string) {
+	if a.confirm == nil {
+		a.setMode(modeOverview)
+		return
+	}
+	a.pendingApproval = nil
+	switch strings.ToLower(id) {
+	case "y":
+		fn := a.confirm.onYes
 		a.confirm = nil
 		a.setMode(modeOverview)
+		if fn != nil {
+			fn()
+		}
+	case "n", "<Escape>", "<Enter>":
+		fn := a.confirm.onNo
+		a.confirm = nil
+		a.setMode(modeOverview)
+		if fn != nil {
+			fn()
+		}
 	}
 }
 
@@ -451,13 +836,23 @@ func (a *App) confirmRemove() {
 }
 
 func (a *App) showHelp() {
-	a.overlay = strings.Join([]string{
+	a.overlayTitle = " Keyboard help "
+	lines := []string{
 		"",
 		"  Navigation",
 		"    ↑/↓ or j/k      select server",
 		"    Enter           host detail",
 		"    Esc             back / cancel",
 		"    /               filter inventory",
+	}
+	if a.aiEnabled() {
+		lines = append(lines,
+			"    :               agent: describe a VPS task",
+			"    Ctrl+A          agent transcript (↑/↓ scroll)",
+			"    Ctrl+X          cancel a running agent task",
+		)
+	}
+	lines = append(lines,
 		"    ?               this help",
 		"    q, Ctrl+C       quit",
 		"",
@@ -471,11 +866,14 @@ func (a *App) showHelp() {
 		"    K               show Bare Eye public key",
 		"",
 		"  Legend",
-		"    online / pending / STALE / offline / auth / host-key / unsupported / disabled",
+		"    green = online   yellow = pending / STALE / unsupported",
+		"    red = offline / auth / host-key   grey = disabled",
+		"    Values shown while a host is down are labelled \"last sample\".",
 		"",
 		"  Data is collected over SSH with read-only commands. Stale data is never",
 		"  shown as live; a changed host key blocks the connection until reviewed.",
-	}, "\n")
+	)
+	a.overlay = strings.Join(lines, "\n")
 	a.setMode(modeHelp)
 }
 
@@ -534,6 +932,9 @@ func (a *App) handleAsync(r asyncResult) {
 					a.setStatus("could not save host key: %v", err)
 					return
 				}
+				if r.fromForm && a.form != nil {
+					a.setMode(modeForm)
+				}
 				a.testServer(r.srv, r.password, r.fromForm)
 			},
 		}
@@ -556,6 +957,7 @@ func (a *App) handleAsync(r asyncResult) {
 		a.promptPassword(r.srv, func(pw string) {
 			if r.fromForm && a.form != nil {
 				a.form.password = pw
+				a.setMode(modeForm)
 				a.testServer(r.srv, pw, true)
 				return
 			}
@@ -684,8 +1086,18 @@ func (a *App) refresh() {
 			continue
 		}
 		srv, err := a.cfg.FindServer(h.ID)
-		if err == nil && (strings.Contains(strings.ToLower(srv.DisplayName()), filter) ||
-			strings.Contains(strings.ToLower(srv.Host), filter)) {
+		if err != nil {
+			continue
+		}
+		match := strings.Contains(strings.ToLower(srv.DisplayName()), filter) ||
+			strings.Contains(strings.ToLower(srv.Host), filter)
+		for _, tag := range srv.Tags {
+			if strings.Contains(strings.ToLower(tag), filter) {
+				match = true
+				break
+			}
+		}
+		if match {
 			a.visible = append(a.visible, h)
 		}
 	}

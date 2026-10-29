@@ -1,0 +1,195 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BINARY: bare-eye
+  COPR_PROJECT: bare-eye
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race ./...
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          commit="${GITHUB_SHA::12}"
+          date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          name="${BINARY}_${version}_${GOOS}_${GOARCH}"
+          mkdir -p "dist/${name}"
+
+          go build -trimpath \
+            -ldflags "-s -w \
+              -X github.com/fiandev/bare-eye/internal/version.Version=${version} \
+              -X github.com/fiandev/bare-eye/internal/version.Commit=${commit} \
+              -X github.com/fiandev/bare-eye/internal/version.Date=${date}" \
+            -o "dist/${name}/${BINARY}" ./cmd/bare-eye
+
+          cp README.md LICENSE "dist/${name}/"
+          tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY }}_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: ${{ env.BINARY }}_*
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum "${BINARY}"_*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/SHA256SUMS \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --generate-notes
+
+  copr:
+    name: Publish to COPR
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install rpmbuild and copr-cli
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y rpm
+          pipx install copr-cli
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # The COPR_CONFIG secret holds the whole config file, e.g.
+      #   [copr-cli]
+      #   username = alfiansa
+      #   login = alfiansa
+      #   token = <api token>
+      #   copr_url = https://copr.fedorainfracloud.org
+      - name: Configure copr-cli
+        env:
+          COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
+        run: |
+          set -euo pipefail
+          if [ -z "${COPR_CONFIG}" ]; then
+            echo "::error::secret COPR_CONFIG is not set"
+            exit 1
+          fi
+          mkdir -p "$HOME/.config"
+          printf '%s\n' "${COPR_CONFIG}" > "$HOME/.config/copr"
+          chmod 600 "$HOME/.config/copr"
+
+      - name: Build source RPM
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          topdir="$PWD/rpmbuild"
+          mkdir -p "$topdir"/{SOURCES,SPECS,SRPMS} stage
+
+          # Source tarball at the tag, with vendored Go modules so the COPR
+          # build does not need network access.
+          git archive --format=tar --prefix="bare-eye-${version}/" HEAD | tar -x -C stage
+          (cd "stage/bare-eye-${version}" && go mod vendor)
+          tar -czf "$topdir/SOURCES/bare-eye-${version}.tar.gz" -C stage "bare-eye-${version}"
+
+          sed "s|^Version:.*|Version:        ${version}|" packaging/bare-eye.spec \
+            > "$topdir/SPECS/bare-eye.spec"
+
+          rpmbuild -bs --define "_topdir ${topdir}" "$topdir/SPECS/bare-eye.spec"
+          ls -l "$topdir"/SRPMS
+
+      - name: Submit COPR build
+        run: |
+          set -euo pipefail
+          copr-cli build "${COPR_PROJECT}" rpmbuild/SRPMS/*.src.rpm

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -118,6 +119,34 @@ func TestConnection(ctx context.Context, srv config.ServerConfig, cfg *config.Co
 	}
 	defer client.Close()
 	return client.Test(ctx, srv.CommandTimeoutOrDefault(cfg))
+}
+
+// Hostname connects to a server and returns its configured hostname.
+func Hostname(ctx context.Context, srv config.ServerConfig, cfg *config.Config, secrets *config.Secrets, password, passphrase string) (string, error) {
+	opts := sshx.Options{
+		KnownHosts:     cfg.SSH.KnownHosts,
+		DefaultKey:     cfg.SSH.DefaultKey,
+		ConnectTimeout: srv.ConnectTimeoutOrDefault(cfg),
+		Password:       password,
+		KeyPassphrase:  passphrase,
+	}
+	if opts.Password == "" && secrets != nil {
+		opts.Password, _ = secrets.Get(srv.ID)
+	}
+	client, err := sshx.Dial(ctx, srv, opts)
+	if err != nil {
+		return "", err
+	}
+	defer client.Close()
+	out, err := client.Run(ctx, "hostname", srv.CommandTimeoutOrDefault(cfg))
+	if err != nil {
+		return "", err
+	}
+	name := strings.TrimSpace(string(out))
+	if name == "" {
+		return "", errors.New("server returned an empty hostname")
+	}
+	return name, nil
 }
 
 // InstallKey connects and appends the public key to authorized_keys.

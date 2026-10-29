@@ -9,7 +9,7 @@ TUI. Nothing is installed on the monitored hosts.
 
 ```
 ┌─ Bare Eye ─────────────────────────────────────────────────────────────┐
-│ Bare Eye 0.1.0   hosts 3 · online 2 · issues 1   interval 2s           │
+│ Bare Eye 1.0.0   hosts 3 · online 2 · issues 1   interval 2s           │
 └─ ? help · a add · e edit · t test · r reconnect · d toggle · q quit────┘
 ```
 
@@ -20,17 +20,19 @@ TUI. Nothing is installed on the monitored hosts.
   remain usable.
 - Linux on the monitored servers. Non-Linux remotes are reported as
   `unsupported`, never faked.
-- `ssh-keygen` for passphrase-protected key generation (an Ed25519 key is
-  generated in pure Go otherwise).
+- No external key tooling: Ed25519 keys (optionally passphrase-protected) are
+  generated in pure Go.
 - An SSH account that can read `/proc` and run `df`, `uname`, `hostname`,
   `grep` and `cat`. No root or agent required.
 
 ## Build
 
 ```sh
+make build                    # builds ./bare-eye and bin/bare-eye
+# or, without make:
 go build -o bare-eye ./cmd/bare-eye
 # optional release metadata
-go build -ldflags "-X github.com/fiandev/bare-eye/internal/version.Version=0.1.0" ./cmd/bare-eye
+go build -ldflags "-X github.com/fiandev/bare-eye/internal/version.Version=1.0.0" ./cmd/bare-eye
 ```
 
 ## Quick start
@@ -57,6 +59,12 @@ bare-eye hosts add \
   --auth key --key ~/.config/bare-eye/keys/bare-eye-ed25519
 ```
 
+When `--id` is omitted it defaults to the host address (for example
+`203.0.113.10`). When `--name` is omitted, Bare Eye uses the hostname reported
+by the server (falling back to reverse DNS and then an interactive prompt)
+instead of storing the IP address as the display name. If no hostname can be
+determined, the name is left empty and the UI shows the address.
+
 Password authentication:
 
 ```sh
@@ -78,9 +86,16 @@ bare-eye config set password db-01        # prompted, never echoed
 | `d` | enable / disable monitoring |
 | `x` | remove server locally (with confirmation) |
 | `/` | filter inventory |
+| `:` | focus the agent input |
+| `Ctrl+A` | open the agent transcript |
+| `Ctrl+X` | cancel a running agent task |
 | `K` | show the Bare Eye public key and fingerprint |
 | `?` | keyboard help |
 | `q`, `Ctrl+C` | quit |
+
+The dashboard repaints every 100ms by default. `bare-eye --tick 250` (accepts
+`0`–`1000` ms, or a duration like `250ms`) changes the repaint interval; `0`
+keeps the 100ms default. Chart data still arrives at `monitoring.interval`.
 
 Status values are intentionally honest:
 
@@ -96,10 +111,70 @@ Status values are intentionally honest:
 - `unsupported` – remote OS is not Linux.
 - `disabled` – monitoring is off for this host.
 
+## AI agent (optional)
+
+Bare Eye can drive an LLM through an OpenAI-compatible chat-completions API to
+inspect and set up the servers it already monitors. The agent is off by default.
+
+```sh
+bare-eye config set api-key            # prompted; encrypted; enables the agent
+# optional override for automation:
+export BARE_EYE_API_KEY=sk-...         # or OPENAI_API_KEY
+```
+
+```yaml
+ai:
+  enabled: true
+  base_url: https://api.openai.com/v1  # any OpenAI-compatible endpoint
+  model: gpt-4o-mini
+  api_key_env: BARE_EYE_API_KEY
+  timeout: 90s
+  command_timeout: 2m
+  max_steps: 12
+```
+
+Press `:` (or type `:` in the dashboard), describe the task, and press `Enter`.
+The input sits below Recent Events, and the latest assistant reply is shown in
+the **Agent response** panel above the input. `Ctrl+A` opens the full transcript;
+the approval dialog also repeats the agent's last message.
+
+When `ai.enabled` is false, both the agent input and the response panel are
+hidden; pressing `:` shows a short notice on how to enable the agent.
+
+`bare-eye config ai` shows the effective settings and where the key comes from
+without printing it. The key itself never appears in `config.yaml`: it lives in
+the AES-GCM encrypted `secrets.enc`. `bare-eye config ai on|off` toggles the
+agent and rewrites the `ai` section of `config.yaml`.
+
+Example prompts:
+
+- "Check why nginx is not serving on prod-01 and fix it."
+- "Install Docker on db-01 and verify the daemon starts."
+- "Compare disk usage on all hosts and suggest what to clean."
+
+Safety rules:
+
+- The agent can list hosts and run shell commands over SSH through
+  `list_hosts` and `run_command`.
+- A conservative allowlist recognises simple read-only commands (`ls`, `cat`,
+  `df`, `systemctl status`, `docker ps`, …). Everything else — including any
+  command with pipes, redirection or substitution — opens an approval dialog
+  with the exact command. Nothing mutating runs without `y`.
+- Commands containing credential paths (`~/.ssh`, `/etc/shadow`, `.env`,
+  passwords, tokens) are never treated as read-only.
+- Unknown or changed SSH host keys and missing passwords are reported, never
+  auto-trusted. Resolve them with `bare-eye hosts test <id>` or
+  `bare-eye config set password <id>`.
+- Output from read-only commands is sent to the configured model endpoint,
+  so run the agent only against endpoints you trust.
+- The API key is stored in the encrypted secrets file (`secrets.enc`, AES-GCM,
+  0600), not in plaintext `config.yaml` or logs. An explicitly set
+  `api_key_env` environment variable overrides the stored key.
+
 ## CLI reference
 
 ```
-bare-eye                          start the dashboard
+bare-eye [--tick 0-1000ms]        start the dashboard
 bare-eye init [--force] [--no-key]
 bare-eye keygen [--force] [--path P] [--comment C]
 bare-eye key show [--path P]
@@ -112,7 +187,9 @@ bare-eye hosts remove <id> [--yes]
 bare-eye hosts enable <id>
 bare-eye hosts disable <id>
 bare-eye config path
+bare-eye config ai [on|off]
 bare-eye config set password <id> [password]
+bare-eye config set api-key [key]
 bare-eye version
 ```
 
@@ -128,7 +205,7 @@ with `BARE_EYE_CONFIG_DIR`).
 ```text
 ~/.config/bare-eye/
 ├── config.yaml          # 0600, no secrets
-├── secrets.enc          # 0600, AES-GCM encrypted passwords
+├── secrets.enc          # 0600, AES-GCM encrypted passwords + AI key
 ├── secrets.key          # 0600, local encryption key
 ├── keys/
 │   ├── bare-eye-ed25519       # 0600
@@ -170,13 +247,16 @@ an SSH agent, or test/install interactively first.
 - **Read-only collection.** The remote script only reads `/proc`, runs `df -P`,
   `uname`, `hostname`, and `grep -c`; no user input is interpolated into
   commands.
-- **No telemetry.** Nothing leaves the local machine except SSH connections to
-  configured hosts.
-- **No secrets in `config.yaml` or logs.** Passwords live in a separate
-  AES-GCM-encrypted file. The encryption key sits beside it with `0600`
-  permissions, which protects against casual disclosure (grep, backups, pasted
-  config output) but not against someone who can read the whole config
-  directory. Prefer keys or an agent when that matters.
+- **No telemetry by default.** Nothing leaves the local machine except SSH
+  connections to configured hosts. The optional AI agent is the exception: when
+  enabled, prompts and command output are sent to the endpoint you configure.
+  Its API key is stored AES-GCM encrypted in `secrets.enc` (or read from the
+  environment when set), never in plaintext.
+- **No secrets in `config.yaml` or logs.** Passwords and the optional AI API key
+  live in a separate AES-GCM-encrypted file. The encryption key sits beside it
+  with `0600` permissions, which protects against casual disclosure (grep,
+  backups, pasted config output) but not against someone who can read the whole
+  config directory. Prefer SSH keys or an agent when that matters.
 - **Guided key installation never overwrites** `authorized_keys`; it appends
   only when the key is absent, after showing the target and action.
 
@@ -191,6 +271,7 @@ internal/sshx         SSH dialing, strict host keys, bounded commands
 internal/collector    fixed remote script + defensive /proc parsing
 internal/scheduler    bounded worker pool, backoff, per-host isolation
 internal/state        status model, bounded history, event log
+internal/agent        optional OpenAI-compatible LLM loop, SSH tools, approvals
 internal/tui          gotui dashboard, detail view, forms, modals
 ```
 
@@ -223,6 +304,15 @@ See [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).
 - Passphrase-protected keys cannot be unlocked by background polling.
 - IPv6 and DNS names are supported; host-key entries use the standard
   `[host]:port` form for non-22 ports.
+
+## MVP decisions
+
+- Password auth is supported and stored encrypted; keys and agents remain the
+  recommended path.
+- Bare Eye maintains its own `known_hosts` (strict, explicit trust only).
+- A guided public-key installation flow is included (`key install`).
+- Remote monitoring is Linux-only for this release.
+- Warning thresholds are configurable and disabled by default (`0`).
 
 ## License
 

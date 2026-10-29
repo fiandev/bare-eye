@@ -16,9 +16,15 @@ import (
 const (
 	secretsFile = "secrets.enc"
 	secretsKey  = "secrets.key"
+
+	// SecretAIAPIKey names the LLM API key inside the encrypted store. The
+	// leading '@' cannot appear in a server ID, so this cannot collide with a
+	// host password.
+	SecretAIAPIKey = "@ai/api-key"
 )
 
-// Secrets stores per-server SSH passwords encrypted at rest.
+// Secrets stores encrypted secrets at rest: per-server SSH passwords and the
+// optional AI API key.
 //
 // The encryption key lives beside the ciphertext with 0600 permissions, so this
 // protects against casual disclosure (backups, grepping a config directory,
@@ -84,6 +90,12 @@ func (s *Secrets) Set(id, password string) {
 
 // Delete removes a stored password for a server ID.
 func (s *Secrets) Delete(id string) { s.Set(id, "") }
+
+// GetSecret returns a named secret that is not tied to a server.
+func (s *Secrets) GetSecret(name string) (string, bool) { return s.Get(name) }
+
+// SetSecret stores a named secret. An empty value deletes it.
+func (s *Secrets) SetSecret(name, value string) { s.Set(name, value) }
 
 // Save encrypts and atomically persists the secrets store.
 func (s *Secrets) Save() error {

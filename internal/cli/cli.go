@@ -7,8 +7,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -27,7 +30,7 @@ import (
 // Run dispatches a command and returns a process exit code.
 func Run(args []string) int {
 	if len(args) == 0 {
-		return runDashboard()
+		return runDashboard(nil)
 	}
 	switch args[0] {
 	case "init":
@@ -41,7 +44,7 @@ func Run(args []string) int {
 	case "config":
 		return cmdConfig(args[1:])
 	case "-screenshot":
-		return runDashboard()
+		return runDashboard(args[1:])
 	case "version", "--version", "-v":
 		fmt.Printf("bare-eye %s (commit %s, built %s)\n", version.Version, version.Commit, version.Date)
 		return 0
@@ -49,6 +52,9 @@ func Run(args []string) int {
 		printHelp()
 		return 0
 	default:
+		if strings.HasPrefix(args[0], "-") {
+			return runDashboard(args)
+		}
 		fmt.Fprintf(os.Stderr, "bare-eye: unknown command %q\n\n", args[0])
 		printHelp()
 		return 2
@@ -59,7 +65,7 @@ func printHelp() {
 	fmt.Print(`Bare Eye — multi-server SSH monitoring TUI
 
 Usage:
-  bare-eye                     Start the interactive dashboard
+  bare-eye [--tick MS]         Start the interactive dashboard
   bare-eye init                Initialize config and optionally generate a key
   bare-eye keygen              Generate a Bare Eye SSH key pair
   bare-eye key show            Print the public key and fingerprint
@@ -72,17 +78,34 @@ Usage:
   bare-eye hosts enable <id>   Enable monitoring for a host
   bare-eye hosts disable <id>  Disable monitoring for a host
   bare-eye config path         Print resolved config paths
+  bare-eye config ai           Show the AI agent status
+  bare-eye config ai on|off    Enable or disable the AI agent
   bare-eye config set password <id> [password]
                                Store an SSH password (encrypted at rest)
+  bare-eye config set api-key [key]
+                               Store the LLM API key (encrypted at rest)
   bare-eye version             Print version/build information
 
 Configuration lives in ~/.config/bare-eye/ (or $XDG_CONFIG_HOME/bare-eye,
 or $BARE_EYE_CONFIG_DIR). Bare Eye never stores plaintext passwords in
 config.yaml and never disables SSH host-key verification.
+
+The dashboard repaints every --tick milliseconds (0-1000, e.g. --tick 250 or
+--tick 250ms). Zero uses the 100ms default. This only affects screen refresh;
+new chart samples still arrive at monitoring.interval.
 `)
 }
 
-func runDashboard() int {
+func runDashboard(args []string) int {
+	tick, err := dashboardTick(args)
+	if errors.Is(err, flag.ErrHelp) {
+		printHelp()
+		return 0
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "bare-eye: %v\n", err)
+		return 2
+	}
 	cfg, secrets, err := loadConfig()
 	if errors.Is(err, config.ErrNotInitialized) {
 		fmt.Fprintln(os.Stderr, "Bare Eye is not initialized.")
@@ -106,11 +129,62 @@ func runDashboard() int {
 	sched.Start()
 	defer sched.Stop()
 
-	if err := tui.Run(cfg, secrets, store, events, sched, version.Version); err != nil {
+	if err := tui.Run(cfg, secrets, store, events, sched, version.Version, tick); err != nil {
 		fmt.Fprintf(os.Stderr, "bare-eye: %v\n", err)
 		return 1
 	}
 	return 0
+}
+
+// maxRenderTick is the slowest allowed dashboard repaint interval.
+const maxRenderTick = time.Second
+
+// tickFlag accepts bare milliseconds ("250") or a duration ("250ms").
+type tickFlag struct {
+	d time.Duration
+}
+
+func (t *tickFlag) String() string { return t.d.String() }
+
+func (t *tickFlag) Set(raw string) error {
+	d, err := parseTick(raw)
+	if err != nil {
+		return err
+	}
+	t.d = d
+	return nil
+}
+
+// parseTick parses a repaint interval and keeps it within 0-1000ms.
+func parseTick(raw string) (time.Duration, error) {
+	s := strings.TrimSpace(raw)
+	var d time.Duration
+	if v, err := time.ParseDuration(s); err == nil {
+		d = v
+	} else if n, err := strconv.Atoi(s); err == nil {
+		d = time.Duration(n) * time.Millisecond
+	} else {
+		return 0, fmt.Errorf("invalid tick %q: use milliseconds (0-1000) or a duration such as 250ms", raw)
+	}
+	if d < 0 || d > maxRenderTick {
+		return 0, fmt.Errorf("tick must be between 0 and 1000ms (got %s)", d)
+	}
+	return d, nil
+}
+
+// dashboardTick parses the flags accepted by the interactive dashboard.
+func dashboardTick(args []string) (time.Duration, error) {
+	fs := flag.NewFlagSet("bare-eye", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	tick := tickFlag{d: tui.DefaultRenderTick}
+	fs.Var(&tick, "tick", "dashboard repaint interval in ms (0-1000, 0 = default)")
+	if err := fs.Parse(args); err != nil {
+		return 0, err
+	}
+	if fs.NArg() > 0 {
+		return 0, fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
+	return tick.d, nil
 }
 
 func loadConfig() (*config.Config, *config.Secrets, error) {
@@ -167,6 +241,9 @@ func cmdInit(args []string) int {
 	if exists && !*force {
 		fmt.Printf("Config already exists: %s\n", filepath.Join(dir, config.FileName))
 		fmt.Println("Leaving it untouched. Use --force to overwrite explicitly.")
+		if loaded, lerr := config.Load(); lerr == nil {
+			cfg = loaded
+		}
 	} else {
 		if err := cfg.Save(); err != nil {
 			fmt.Fprintf(os.Stderr, "bare-eye: %v\n", err)
@@ -188,6 +265,22 @@ func cmdInit(args []string) int {
 		return 0
 	}
 	if !confirm("Generate a dedicated Ed25519 SSH key now?", true) {
+		if confirm("Use an existing private key instead?", false) {
+			p := prompt("Private key path", "~/.ssh/id_ed25519")
+			expanded, perr := config.ExpandPath(p)
+			if perr != nil {
+				fmt.Fprintf(os.Stderr, "bare-eye: %v\n", perr)
+				return 1
+			}
+			cfg.SSH.DefaultKey = expanded
+			if err := cfg.Save(); err != nil {
+				fmt.Fprintf(os.Stderr, "bare-eye: %v\n", err)
+				return 1
+			}
+			fmt.Printf("Using existing key: %s\n", expanded)
+			showKey(expanded)
+			return 0
+		}
 		fmt.Println("Skipped key generation. Run `bare-eye keygen` when ready.")
 		return 0
 	}
@@ -482,8 +575,8 @@ func cmdHostsList(args []string) int {
 
 func cmdHostsAdd(args []string) int {
 	fs := flag.NewFlagSet("hosts add", flag.ContinueOnError)
-	id := fs.String("id", "", "stable server ID")
-	name := fs.String("name", "", "friendly name")
+	id := fs.String("id", "", "stable server ID (default: host address)")
+	name := fs.String("name", "", "friendly name (default: server hostname)")
 	host := fs.String("host", "", "hostname or IP")
 	port := fs.Int("port", 22, "SSH port")
 	user := fs.String("user", "", "SSH username")
@@ -494,16 +587,15 @@ func cmdHostsAdd(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	cfg, _, err := loadConfig()
+	explicit := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+	cfg, secrets, err := loadConfig()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "bare-eye: %v\n", err)
 		return 1
 	}
 	if *host == "" && isInteractive() {
 		*host = prompt("Host (hostname or IP)", "")
-	}
-	if *name == "" {
-		*name = *host
 	}
 	if *user == "" {
 		if cfg.SSH.DefaultUser != "" {
@@ -512,8 +604,31 @@ func cmdHostsAdd(args []string) int {
 			*user = prompt("SSH user", os.Getenv("USER"))
 		}
 	}
+	if isInteractive() {
+		if !explicit["port"] {
+			v := prompt("SSH port", "22")
+			if n, perr := strconv.Atoi(v); perr == nil {
+				*port = n
+			}
+		}
+		if !explicit["auth"] {
+			*auth = prompt("Auth method (key/agent/password)", "key")
+		}
+		if *auth == config.AuthKey && !explicit["key"] && isInteractive() {
+			*keyPath = prompt("Key path", cfg.SSH.DefaultKey)
+		}
+	}
 	if *id == "" {
-		*id = config.Slug(*name)
+		// Default to the server address (usually its IP). IDs must be
+		// filesystem/CLI friendly, so fall back to a slug for IPv6 literals
+		// and other values containing the colon character.
+		*id = *host
+		if !config.ValidID(*id) {
+			*id = config.Slug(*id)
+		}
+	}
+	if isInteractive() && !explicit["id"] {
+		*id = strings.TrimSpace(prompt("Server ID", *id))
 	}
 	if *keyPath == "" && *auth == config.AuthKey {
 		*keyPath = cfg.SSH.DefaultKey
@@ -526,6 +641,9 @@ func cmdHostsAdd(args []string) int {
 		User:    *user,
 		Auth:    config.AuthConfig{Method: *auth, KeyPath: *keyPath},
 		Enabled: !*disabled,
+	}
+	if !explicit["name"] {
+		srv.Name = resolveHostName(srv, cfg, secrets)
 	}
 	if *tags != "" {
 		for _, t := range strings.Split(*tags, ",") {
@@ -552,6 +670,73 @@ func cmdHostsAdd(args []string) int {
 		fmt.Printf("Store a password now? Run: bare-eye config set password %s\n", srv.ID)
 	}
 	return 0
+}
+
+// resolveHostName chooses the friendly name shown for a new host. IP
+// addresses are resolved to the server's own hostname (over SSH, then reverse
+// DNS) instead of using the raw address as the display name.
+func resolveHostName(srv config.ServerConfig, cfg *config.Config, secrets *config.Secrets) string {
+	host := strings.TrimSpace(srv.Host)
+	if host == "" {
+		return ""
+	}
+	if net.ParseIP(host) == nil {
+		// The user already gave us a hostname.
+		return host
+	}
+	if name := sshHostName(srv, cfg, secrets); name != "" {
+		return name
+	}
+	if name := reverseHostName(host); name != "" {
+		return name
+	}
+	if isInteractive() {
+		if name := strings.TrimSpace(prompt("Server name (hostname)", "")); name != "" {
+			return name
+		}
+	}
+	// Never persist the raw address as the display name; an empty name lets
+	// the UI fall back to the address without writing it into config.yaml.
+	return ""
+}
+
+// sshHostName asks the server for its configured hostname. It is best-effort:
+// unresolved keys, missing credentials or unreachable hosts fall through to
+// the other name sources.
+func sshHostName(srv config.ServerConfig, cfg *config.Config, secrets *config.Secrets) string {
+	if srv.Auth.Method == config.AuthPassword {
+		if p, ok := secrets.Get(srv.ID); !ok || p == "" {
+			// Password auth has not been configured for this new host yet.
+			return ""
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	name, err := scheduler.Hostname(ctx, srv, cfg, secrets, "", "")
+	var unknown *sshx.UnknownHostKeyError
+	if errors.As(err, &unknown) && isInteractive() {
+		fmt.Printf("Unknown host key for %s\nFingerprint (SHA256): %s\n", unknown.Host, unknown.Fingerprint)
+		if confirm("Trust and save this host key?", false) {
+			if aerr := sshx.AppendKnownHost(cfg.SSH.KnownHosts, unknown.Host, unknown.Key); aerr != nil {
+				return ""
+			}
+			name, err = scheduler.Hostname(ctx, srv, cfg, secrets, "", "")
+		}
+	}
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(name)
+}
+
+func reverseHostName(host string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	names, err := net.DefaultResolver.LookupAddr(ctx, host)
+	if err != nil || len(names) == 0 {
+		return ""
+	}
+	return strings.TrimSuffix(strings.TrimSpace(names[0]), ".")
 }
 
 func cmdHostsTest(args []string) int {
@@ -700,7 +885,7 @@ func cmdHostsToggle(action string, args []string) int {
 
 func cmdConfig(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: bare-eye config path | config set password <id> [password]")
+		fmt.Fprintln(os.Stderr, "usage: bare-eye config path | config ai [on|off] | config set password <id> [password] | config set api-key [key]")
 		return 2
 	}
 	switch args[0] {
@@ -713,10 +898,13 @@ func cmdConfig(args []string) int {
 		keysDir, _ := config.KeysDir()
 		fmt.Printf("config dir:  %s\n", dir)
 		fmt.Printf("config file: %s\n", filepath.Join(dir, config.FileName))
+		fmt.Printf("secrets:     %s\n", filepath.Join(dir, "secrets.enc"))
 		fmt.Printf("keys dir:    %s\n", keysDir)
 		known, _ := config.DefaultKnownHosts()
 		fmt.Printf("known_hosts: %s\n", known)
 		return 0
+	case "ai":
+		return cmdConfigAI(args[1:])
 	case "set":
 		return cmdConfigSet(args[1:])
 	default:
@@ -726,27 +914,49 @@ func cmdConfig(args []string) int {
 }
 
 func cmdConfigSet(args []string) int {
+	if len(args) >= 1 && args[0] == "api-key" {
+		return cmdConfigSetAPIKey(args[1:])
+	}
 	if len(args) < 2 || args[0] != "password" {
 		fmt.Fprintln(os.Stderr, "usage: bare-eye config set password <id> [password]")
-		fmt.Fprintln(os.Stderr, "Omit the password to be prompted securely.")
+		fmt.Fprintln(os.Stderr, "       bare-eye config set api-key [key]")
+		fmt.Fprintln(os.Stderr, "Omit the value to be prompted securely.")
 		return 2
 	}
-	id := args[1]
 	cfg, secrets, err := loadConfig()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "bare-eye: %v\n", err)
 		return 1
+	}
+	id := ""
+	pw := ""
+	switch len(args) {
+	case 2:
+		// "config set password <id>" (prompt) or, with exactly one server,
+		// "config set password <password>".
+		if _, ferr := cfg.FindServer(args[1]); ferr == nil {
+			id = args[1]
+		} else if len(cfg.Servers) == 1 {
+			id = cfg.Servers[0].ID
+			pw = args[1]
+			fmt.Fprintln(os.Stderr, "warning: passwords passed as arguments may leak via shell history and process listings.")
+		} else {
+			fmt.Fprintf(os.Stderr, "bare-eye: server %q not found; usage: bare-eye config set password <id> [password]\n", args[1])
+			return 1
+		}
+	case 3:
+		id, pw = args[1], args[2]
+		fmt.Fprintln(os.Stderr, "warning: passwords passed as arguments may leak via shell history and process listings.")
+	default:
+		fmt.Fprintln(os.Stderr, "usage: bare-eye config set password <id> [password]")
+		return 2
 	}
 	srv, err := cfg.FindServer(id)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "bare-eye: %v\n", err)
 		return 1
 	}
-	var pw string
-	if len(args) >= 3 {
-		pw = args[2]
-		fmt.Fprintln(os.Stderr, "warning: passwords passed as arguments may leak via shell history and process listings.")
-	} else {
+	if pw == "" {
 		if !isInteractive() {
 			fmt.Fprintln(os.Stderr, "bare-eye: no password provided and stdin is not a terminal")
 			return 1
@@ -775,6 +985,123 @@ func cmdConfigSet(args []string) int {
 		fmt.Fprintf(os.Stderr, "note: %s uses auth method %q; set auth.method to password to use it.\n", srv.ID, srv.Auth.Method)
 	}
 	fmt.Printf("Password stored for %s (encrypted at rest, 0600).\n", srv.ID)
+	return 0
+}
+
+func cmdConfigAI(args []string) int {
+	cfg, secrets, err := loadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "bare-eye: %v\n", err)
+		return 1
+	}
+	changed := false
+	if len(args) > 1 {
+		fmt.Fprintln(os.Stderr, "usage: bare-eye config ai [on|off]")
+		return 2
+	}
+	if len(args) == 1 {
+		switch args[0] {
+		case "on", "enable":
+			cfg.AI.Enabled = true
+			changed = true
+		case "off", "disable":
+			cfg.AI.Enabled = false
+			changed = true
+		default:
+			fmt.Fprintln(os.Stderr, "usage: bare-eye config ai [on|off]")
+			return 2
+		}
+	}
+	if changed {
+		if err := cfg.Save(); err != nil {
+			fmt.Fprintf(os.Stderr, "bare-eye: %v\n", err)
+			return 1
+		}
+	}
+	envName := cfg.AI.APIKeyEnv
+	if envName == "" {
+		envName = "BARE_EYE_API_KEY"
+	}
+	keyState := "not stored"
+	stored := false
+	if secrets != nil {
+		if v, ok := secrets.GetSecret(config.SecretAIAPIKey); ok && v != "" {
+			stored = true
+		}
+	}
+	switch {
+	case os.Getenv(envName) != "":
+		keyState = "environment (" + envName + ")"
+	case stored:
+		keyState = "encrypted store (secrets.enc)"
+	case os.Getenv("OPENAI_API_KEY") != "":
+		keyState = "environment (OPENAI_API_KEY)"
+	}
+	fmt.Printf("enabled:  %t\n", cfg.AI.Enabled)
+	fmt.Printf("base_url: %s\n", cfg.AI.BaseURL)
+	fmt.Printf("model:    %s\n", cfg.AI.Model)
+	fmt.Printf("api key:  %s\n", keyState)
+	if changed {
+		fmt.Println("Saved. Restart bare-eye to apply.")
+	}
+	return 0
+}
+
+func cmdConfigSetAPIKey(args []string) int {
+	if len(args) > 1 {
+		fmt.Fprintln(os.Stderr, "usage: bare-eye config set api-key [key]")
+		return 2
+	}
+	cfg, secrets, err := loadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "bare-eye: %v\n", err)
+		return 1
+	}
+	key := ""
+	if len(args) == 1 {
+		key = strings.TrimSpace(args[0])
+		fmt.Fprintln(os.Stderr, "warning: keys passed as arguments may leak via shell history and process listings.")
+	}
+	if key == "" {
+		if !isInteractive() {
+			fmt.Fprintln(os.Stderr, "bare-eye: no API key provided and stdin is not a terminal")
+			return 1
+		}
+		key, err = promptSecret("API key: ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "bare-eye: %v\n", err)
+			return 1
+		}
+		again, err := promptSecret("Repeat API key: ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "bare-eye: %v\n", err)
+			return 1
+		}
+		if key != again {
+			fmt.Fprintln(os.Stderr, "bare-eye: API keys do not match")
+			return 1
+		}
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		fmt.Fprintln(os.Stderr, "bare-eye: API key is empty")
+		return 1
+	}
+	secrets.SetSecret(config.SecretAIAPIKey, key)
+	if err := secrets.Save(); err != nil {
+		fmt.Fprintf(os.Stderr, "bare-eye: %v\n", err)
+		return 1
+	}
+	cfg.AI.Enabled = true
+	if err := cfg.Save(); err != nil {
+		fmt.Fprintf(os.Stderr, "bare-eye: %v\n", err)
+		return 1
+	}
+	dir, _ := config.Dir()
+	fmt.Println("AI API key stored encrypted at rest (0600).")
+	fmt.Printf("  location: %s\n", filepath.Join(dir, "secrets.enc"))
+	fmt.Printf("  config:   %s (ai.enabled: true)\n", filepath.Join(dir, config.FileName))
+	fmt.Println("Restart bare-eye to apply.")
 	return 0
 }
 

@@ -52,7 +52,7 @@ func Dial(ctx context.Context, srv config.ServerConfig, opts Options) (*Client, 
 	}
 	auth, closers, err := authMethods(srv, opts)
 	if err != nil {
-		return nil, err
+		return nil, &AuthError{User: srv.User, Host: srv.Addr(), Err: err}
 	}
 	closeAll := func() {
 		for _, c := range closers {

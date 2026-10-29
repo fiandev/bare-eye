@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	ui "github.com/metaspartan/gotui/v5"
-	"github.com/metaspartan/gotui/v5/widgets"
 
 	"github.com/fiandev/bare-eye/internal/collector"
 	"github.com/fiandev/bare-eye/internal/state"
@@ -25,21 +24,63 @@ func (a *App) layout() {
 	a.header.SetRect(0, 0, w, headerH)
 
 	eventsH := 6
-	if h < 26 {
+	if h < 30 {
 		eventsH = 4
 	}
-	if h < 16 {
+	if h < 20 {
 		eventsH = 0
+	}
+	// The agent input and response panels only exist when the agent is enabled.
+	inputH, respH := 0, 0
+	if a.aiEnabled() {
+		inputH = 3
+		if h < 14 {
+			inputH = 0
+		}
+		respH = 6
+		if h < 34 {
+			respH = 5
+		}
+		if h < 26 {
+			respH = 4
+		}
+		if h < 22 {
+			respH = 0
+		}
 	}
 	bodyTop := headerH
-	bodyBottom := h - eventsH
-	if bodyBottom < bodyTop+6 {
-		bodyBottom = h
+	avail := h - inputH - respH - eventsH
+	if avail < bodyTop+6 {
 		eventsH = 0
+		avail = h - inputH - respH
+	}
+	if avail < bodyTop+6 {
+		respH = 0
+		avail = h - inputH
+	}
+	if avail < bodyTop+6 {
+		inputH = 0
+		avail = h
+	}
+	bottom := h
+	if inputH > 0 {
+		a.prompt.SetRect(0, h-inputH, w, h)
+		bottom = h - inputH
+	} else {
+		a.prompt.SetRect(0, 0, 0, 0)
+	}
+	if respH > 0 {
+		a.agentView.SetRect(0, bottom-respH, w, bottom)
+		bottom -= respH
+	} else {
+		a.agentView.SetRect(0, 0, 0, 0)
 	}
 	if eventsH > 0 {
-		a.eventLog.SetRect(0, h-eventsH, w, h)
+		a.eventLog.SetRect(0, bottom-eventsH, w, bottom)
+	} else {
+		a.eventLog.SetRect(0, 0, 0, 0)
 	}
+	bodyBottom := avail
 
 	if w >= 110 {
 		leftW := int(float64(w) * 0.56)
@@ -107,13 +148,36 @@ func (a *App) layout() {
 	half := bodyTop + (bodyBottom-bodyTop)/2
 	a.detail.SetRect(0, bodyTop, leftW, half)
 	a.disk.SetRect(0, half, leftW, bodyBottom)
-	a.net.SetRect(leftW, bodyTop, w, bodyBottom)
+
+	// Right column: network counters on top, rate chart underneath.
+	rightH := bodyBottom - bodyTop
+	netH := rightH
+	switch {
+	case rightH >= 18:
+		netH = 9
+	case rightH >= 12:
+		netH = 7
+	}
+	netEnd := bodyTop + netH
+	a.net.SetRect(leftW, bodyTop, w, netEnd)
+	if bodyBottom-netEnd >= 5 {
+		a.netPlot.SetRect(leftW, netEnd, w, bodyBottom)
+	} else {
+		a.netPlot.SetRect(leftW, netEnd, w, netEnd)
+	}
 }
 
 func (a *App) render() {
 	if a.dirtyClear {
 		ui.Clear()
 		a.dirtyClear = false
+	}
+	if a.width < 50 || a.height < 10 {
+		a.modal.Title = " Bare Eye "
+		a.modal.Text = fmt.Sprintf("\n  Terminal too small: %dx%d\n\n  Bare Eye needs at least 50x10.\n  Resize the terminal to continue.", a.width, a.height)
+		a.modal.SetRect(0, 0, a.width, a.height)
+		ui.Render(a.modal)
+		return
 	}
 	switch a.mode {
 	case modeForm:
@@ -125,7 +189,11 @@ func (a *App) render() {
 			a.renderModal(title, a.form.render())
 		}
 	case modeHelp:
-		a.renderModal(" Keyboard help ", a.overlay)
+		title := a.overlayTitle
+		if title == "" {
+			title = " Keyboard help "
+		}
+		a.renderModal(title, a.overlay)
 	case modeKeyInfo:
 		a.renderModal(" Bare Eye key / security notice ", a.overlay)
 	case modeConfirm:
@@ -137,6 +205,8 @@ func (a *App) render() {
 			text := fmt.Sprintf("\n  Password for %s@%s\n\n  [%s]\n\n  Enter to save · Esc to cancel", a.password.srv.User, a.password.srv.Addr(), strings.Repeat("•", len([]rune(a.password.value))))
 			a.renderModal(" SSH password required ", text)
 		}
+	case modeAgentLog:
+		a.renderAgentLog()
 	case modeDetail:
 		a.renderDetail()
 	default:
@@ -162,7 +232,14 @@ func (a *App) renderOverview() {
 		header += fmt.Sprintf("  filter: %q", a.filter)
 	}
 	a.header.Text = truncate(header, a.width-2)
-	hint := "? help · a add · e edit · t test · r reconnect · d toggle · x remove · / filter · q quit"
+	hint := "? help · a add · e edit · t test · r reconnect · d toggle · x remove · / filter"
+	if a.aiEnabled() {
+		hint += " · : agent"
+	}
+	hint += " · q quit"
+	if a.agentBusy {
+		hint = "agent: working…   |   " + hint
+	}
 	if a.status != "" {
 		hint = a.status + "   |   " + hint
 	}
@@ -171,6 +248,8 @@ func (a *App) renderOverview() {
 	a.buildTable()
 	a.buildDetailPanels()
 	a.buildEvents()
+	a.updatePrompt()
+	a.updateAgentView()
 	items := []ui.Drawable{a.header}
 	for _, w := range []ui.Drawable{a.table, a.cpu, a.mem, a.swap} {
 		if w.GetRect().Dy() > 0 && w.GetRect().Dx() > 0 {
@@ -183,22 +262,44 @@ func (a *App) renderOverview() {
 	if a.eventLog.GetRect().Dy() > 0 {
 		items = append(items, a.eventLog)
 	}
+	if a.agentView.GetRect().Dy() > 0 {
+		items = append(items, a.agentView)
+	}
+	if a.prompt.GetRect().Dy() > 0 {
+		items = append(items, a.prompt)
+	}
 	ui.Render(items...)
 }
 
 func (a *App) renderDetail() {
 	a.header.Text = truncate(a.detailHeader(), a.width-2)
-	a.header.TitleBottom = " Esc back · e edit · t test · r reconnect · q quit"
+	hint := "Esc back · e edit · t test · r reconnect"
+	if a.aiEnabled() {
+		hint += " · : agent"
+	}
+	hint += " · q quit"
+	if a.agentBusy {
+		hint = "agent: working…   |   " + hint
+	}
+	a.header.TitleBottom = " " + truncate(hint, a.width-2)
 	a.buildDetailPanels()
 	a.buildEvents()
+	a.updatePrompt()
+	a.updateAgentView()
 	items := []ui.Drawable{a.header}
-	for _, w := range []ui.Drawable{a.detail, a.disk, a.net} {
+	for _, w := range []ui.Drawable{a.detail, a.disk, a.net, a.netPlot} {
 		if w.GetRect().Dy() > 0 && w.GetRect().Dx() > 0 {
 			items = append(items, w)
 		}
 	}
 	if a.eventLog.GetRect().Dy() > 0 {
 		items = append(items, a.eventLog)
+	}
+	if a.agentView.GetRect().Dy() > 0 {
+		items = append(items, a.agentView)
+	}
+	if a.prompt.GetRect().Dy() > 0 {
+		items = append(items, a.prompt)
 	}
 	ui.Render(items...)
 }
@@ -273,12 +374,13 @@ func (a *App) buildDetailPanels() {
 		a.cpu.Percent, a.cpu.Label = 0, "no host selected"
 		a.mem.Percent, a.mem.Label = 0, "no host selected"
 		a.swap.Percent, a.swap.Label = 0, "no host selected"
-		dummy := widgets.NewSparkline()
-		dummy.Title = "CPU %"
-		a.spark.Sparklines = []*widgets.Sparkline{dummy}
 		a.detail.Text = "\n  No servers configured.\n\n  Press 'a' to add one, or run:\n    bare-eye hosts add"
 		a.disk.Rows = nil
 		a.net.Text = ""
+		a.netPlot.Series = nil
+		a.netPlot.MaxVal = 1
+		a.netPlot.Title = " Network rate "
+		a.spark.Series = nil
 		return
 	}
 	m := h.Metrics
@@ -321,17 +423,10 @@ func (a *App) buildDetailPanels() {
 	}
 
 	cpuData, memData := historySeries(h.History)
-	cpuSpark := widgets.NewSparkline()
-	cpuSpark.Title = "CPU %"
-	cpuSpark.Data = cpuData
-	cpuSpark.LineColor = ui.ColorGreen
-	cpuSpark.MaxVal = 100
-	memSpark := widgets.NewSparkline()
-	memSpark.Title = "MEM %"
-	memSpark.Data = memData
-	memSpark.LineColor = ui.ColorCyan
-	memSpark.MaxVal = 100
-	a.spark.Sparklines = []*widgets.Sparkline{cpuSpark, memSpark}
+	a.spark.Series = []chartSeries{
+		{Color: ui.ColorGreen, Data: cpuData},
+		{Color: ui.ColorCyan, Data: memData},
+	}
 
 	a.detail.Title = " " + srv.DisplayName() + " "
 	var b strings.Builder
@@ -380,6 +475,37 @@ func (a *App) buildDetailPanels() {
 		fmt.Fprintf(&n, "\n  Waiting for the first sample…\n")
 	}
 	a.net.Text = n.String()
+
+	a.buildNetChart(h)
+}
+
+// buildNetChart feeds the RX/TX rate history into the network chart.
+func (a *App) buildNetChart(h *state.HostState) {
+	a.netPlot.Series = nil
+	a.netPlot.MaxVal = 1
+	a.netPlot.Title = " Network rate "
+	if a.netPlot.GetRect().Dy() <= 0 {
+		return
+	}
+	rx, tx := netSeries(h.History)
+	// One chart column per sample; keep only what fits.
+	if inner := a.netPlot.Inner.Dx(); inner > 1 && len(rx) > inner {
+		rx = rx[len(rx)-inner:]
+		tx = tx[len(tx)-inner:]
+	}
+	if len(rx) < 2 {
+		return
+	}
+	peak := seriesPeak(rx, tx)
+	if peak <= 0 {
+		peak = 1
+	}
+	a.netPlot.Series = []chartSeries{
+		{Color: ui.ColorGreen, Data: rx},
+		{Color: ui.ColorYellow, Data: tx},
+	}
+	a.netPlot.MaxVal = peak
+	a.netPlot.Title = fmt.Sprintf(" Network rate · peak %s ", humanRate(peak))
 }
 
 func (a *App) buildEvents() {
@@ -426,6 +552,92 @@ func (a *App) renderModal(title, text string) {
 	ui.Render(a.modal)
 }
 
+func (a *App) updatePrompt() {
+	if a.prompt == nil {
+		return
+	}
+	switch {
+	case a.mode == modeAgentInput:
+		a.prompt.Title = " Agent · Enter send · Esc close "
+		a.prompt.TitleStyle = ui.NewStyle(ui.ColorCyan, ui.ColorClear, ui.ModifierBold)
+		a.prompt.BorderStyle = ui.NewStyle(ui.ColorCyan)
+		a.prompt.Placeholder = "Describe a VPS setup task…"
+		a.prompt.TitleBottom = " every mutating command needs approval "
+	case a.agentBusy:
+		a.prompt.Title = " Agent · running… "
+		a.prompt.BorderStyle = ui.NewStyle(ui.ColorYellow)
+		a.prompt.Placeholder = "Agent is working · Ctrl+A shows the transcript"
+		a.prompt.TitleBottom = " "
+	default:
+		a.prompt.Title = " Agent "
+		a.prompt.TitleStyle = ui.NewStyle(ui.ColorLightGrey, ui.ColorClear, ui.ModifierBold)
+		a.prompt.BorderStyle = ui.NewStyle(ui.ColorLightGrey)
+		a.prompt.Placeholder = "Describe a VPS setup task…   ( : to focus · Ctrl+A transcript )"
+		a.prompt.TitleBottom = " "
+	}
+}
+
+func (a *App) updateAgentView() {
+	if a.agentView == nil {
+		return
+	}
+	text := strings.TrimSpace(a.lastReply)
+	switch {
+	case text == "" && a.agentBusy:
+		text = "Thinking…"
+	case text == "":
+		text = "No agent response yet.\n\nPress ':' and describe a VPS task. Ctrl+A opens the full transcript."
+	case a.agentBusy:
+		text += "\n\n(working…)"
+	}
+	a.agentView.Text = text
+	switch {
+	case a.agentBusy:
+		a.agentView.Title = " Agent response · working… · Ctrl+A transcript "
+		a.agentView.BorderStyle = ui.NewStyle(ui.ColorYellow)
+	case a.mode == modeAgentInput:
+		a.agentView.Title = " Agent response · Enter send · Ctrl+A transcript "
+		a.agentView.BorderStyle = ui.NewStyle(ui.ColorCyan)
+	default:
+		a.agentView.Title = " Agent response · Ctrl+A transcript "
+		a.agentView.BorderStyle = ui.NewStyle(ui.ColorLightGrey)
+	}
+}
+
+func (a *App) renderAgentLog() {
+	text := "\n  No agent transcript yet.\n\n  Press ':' , describe a VPS task, and press Enter.\n"
+	if len(a.transcript) > 0 {
+		maxLines := a.height - 8
+		if maxLines > 24 {
+			maxLines = 24
+		}
+		if maxLines < 5 {
+			maxLines = 5
+		}
+		end := len(a.transcript) - a.agentScroll
+		if end < maxLines {
+			end = maxLines
+		}
+		if end > len(a.transcript) {
+			end = len(a.transcript)
+		}
+		start := end - maxLines
+		if start < 0 {
+			start = 0
+		}
+		var b strings.Builder
+		b.WriteString("\n")
+		for _, line := range a.transcript[start:end] {
+			b.WriteString("  " + truncate(line, a.width-8) + "\n")
+		}
+		if a.agentScroll > 0 {
+			b.WriteString(fmt.Sprintf("\n  ↑ %d lines from the end\n", a.agentScroll))
+		}
+		text = b.String()
+	}
+	a.renderModal(" Agent transcript · ↑/↓ scroll · Esc close ", text)
+}
+
 func maxDisk(fs []collector.Filesystem) (float64, bool) {
 	var max float64
 	found := false
@@ -450,6 +662,30 @@ func historySeries(hist []state.Sample) (cpu, mem []float64) {
 		mem = append(mem, s.Mem)
 	}
 	return cpu, mem
+}
+
+func netSeries(hist []state.Sample) (rx, tx []float64) {
+	start := 0
+	if len(hist) > 120 {
+		start = len(hist) - 120
+	}
+	for _, s := range hist[start:] {
+		rx = append(rx, s.NetRX)
+		tx = append(tx, s.NetTX)
+	}
+	return rx, tx
+}
+
+func seriesPeak(series ...[]float64) float64 {
+	var peak float64
+	for _, s := range series {
+		for _, v := range s {
+			if v > peak {
+				peak = v
+			}
+		}
+	}
+	return peak
 }
 
 func statusColor(s state.Status) ui.Color {

@@ -60,11 +60,6 @@ func TestGenerateRefusesOverwrite(t *testing.T) {
 }
 
 func TestPassphraseProtectedKey(t *testing.T) {
-	if _, err := os.Stat("/usr/bin/ssh-keygen"); err != nil {
-		if _, err := os.Stat("/bin/ssh-keygen"); err != nil {
-			t.Skip("ssh-keygen not available")
-		}
-	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "id")
 	if err := Generate(path, "correct horse", "", false); err != nil {

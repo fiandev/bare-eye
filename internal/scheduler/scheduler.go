@@ -118,6 +118,11 @@ func (s *Scheduler) loop(w *worker) {
 		if s.ctx.Err() != nil {
 			return
 		}
+		s.store.Update(w.srv.ID, func(h *state.HostState) {
+			if h.Status == state.StatusDisabled {
+				h.Status = state.StatusPending
+			}
+		})
 		m, err := s.probe(w)
 		if s.ctx.Err() != nil {
 			return

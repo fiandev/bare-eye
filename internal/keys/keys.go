@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -18,7 +17,7 @@ import (
 // ErrExists is returned when a key already exists and overwrite is false.
 var ErrExists = errors.New("key already exists")
 
-// Generate creates an Ed25519 key pair at path using ssh-keygen when available.
+// Generate creates an Ed25519 key pair in OpenSSH format at path.
 // A non-empty passphrase encrypts the private key. Existing files are never
 // overwritten unless force is true.
 func Generate(path, passphrase, comment string, force bool) error {
@@ -34,24 +33,15 @@ func Generate(path, passphrase, comment string, force bool) error {
 		return fmt.Errorf("create key directory: %w", err)
 	}
 	if force {
-		// ssh-keygen prompts interactively when files exist; remove explicitly.
+		// Remove explicitly so regeneration is deterministic and non-interactive.
 		_ = os.Remove(path)
 		_ = os.Remove(path + ".pub")
 	}
 	if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("set key directory permissions: %w", err)
 	}
-	if _, err := exec.LookPath("ssh-keygen"); err == nil {
-		if err := generateWithSSHKeygen(path, passphrase, comment); err != nil {
-			return err
-		}
-	} else {
-		if passphrase != "" {
-			return errors.New("ssh-keygen is required to create a passphrase-protected key")
-		}
-		if err := generateInGo(path, comment); err != nil {
-			return err
-		}
+	if err := generateInGo(path, passphrase, comment); err != nil {
+		return err
 	}
 	if err := os.Chmod(path, 0o600); err != nil {
 		return err
@@ -62,26 +52,17 @@ func Generate(path, passphrase, comment string, force bool) error {
 	return nil
 }
 
-func generateWithSSHKeygen(path, passphrase, comment string) error {
-	if comment == "" {
-		comment = "bare-eye"
-	}
-	args := []string{"-q", "-t", "ed25519", "-f", path, "-N", passphrase, "-C", comment}
-	cmd := exec.Command("ssh-keygen", args...)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("ssh-keygen failed: %w", err)
-	}
-	return nil
-}
-
-func generateInGo(path, comment string) error {
+func generateInGo(path, passphrase, comment string) error {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return err
 	}
-	block, err := ssh.MarshalPrivateKey(priv, comment)
+	var block *pem.Block
+	if passphrase != "" {
+		block, err = ssh.MarshalPrivateKeyWithPassphrase(priv, comment, []byte(passphrase))
+	} else {
+		block, err = ssh.MarshalPrivateKey(priv, comment)
+	}
 	if err != nil {
 		return err
 	}

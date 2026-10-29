@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fiandev/bare-eye/internal/agent"
 	"github.com/fiandev/bare-eye/internal/config"
 	"github.com/fiandev/bare-eye/internal/state"
 )
@@ -143,6 +144,20 @@ func TestFormAuthCycle(t *testing.T) {
 	}
 }
 
+func TestNetSeriesAndPeak(t *testing.T) {
+	hist := []state.Sample{
+		{NetRX: 100, NetTX: 10},
+		{NetRX: 400, NetTX: 50},
+	}
+	rx, tx := netSeries(hist)
+	if len(rx) != 2 || rx[1] != 400 || tx[1] != 50 {
+		t.Errorf("series = %v / %v", rx, tx)
+	}
+	if peak := seriesPeak(rx, tx); peak != 400 {
+		t.Errorf("peak = %v, want 400", peak)
+	}
+}
+
 func TestHistorySeriesSkipsInvalidCPU(t *testing.T) {
 	hist := []state.Sample{
 		{CPUValid: false, Mem: 10},
@@ -157,5 +172,151 @@ func TestHistorySeriesSkipsInvalidCPU(t *testing.T) {
 	}
 	if !strings.Contains(statusLabel(state.StatusHostKey), "host") {
 		t.Error("host-key label")
+	}
+}
+
+func newTestApp(t *testing.T) *App {
+	t.Helper()
+	cfg, err := config.Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return newApp(cfg, nil, state.New(10*time.Second), state.NewEventLog(20), nil, "test")
+}
+
+func TestAgentInputEditing(t *testing.T) {
+	a := newTestApp(t)
+	a.cfg.AI.Enabled = true
+	a.focusAgent()
+	if a.mode != modeAgentInput {
+		t.Fatalf("mode = %v", a.mode)
+	}
+	for _, r := range []string{"s", "e", "t", "u", "p"} {
+		a.handleAgentInputKey(r)
+	}
+	a.handleAgentInputKey("<Backspace>")
+	if a.prompt.Text != "setu" {
+		t.Fatalf("text = %q", a.prompt.Text)
+	}
+	a.handleAgentInputKey("<Left>")
+	a.handleAgentInputKey("X")
+	if a.prompt.Text != "setXu" || a.prompt.Cursor != 4 {
+		t.Fatalf("text = %q cursor = %d", a.prompt.Text, a.prompt.Cursor)
+	}
+	a.handleAgentInputKey("<C-u>")
+	if a.prompt.Text != "" || a.prompt.Cursor != 0 {
+		t.Fatalf("text = %q cursor = %d", a.prompt.Text, a.prompt.Cursor)
+	}
+	a.handleAgentInputKey("<Escape>")
+	if a.mode != modeOverview {
+		t.Fatalf("mode = %v", a.mode)
+	}
+}
+
+func TestAgentSubmitShowsSetupWhenUnconfigured(t *testing.T) {
+	a := newTestApp(t)
+	a.cfg.AI.Enabled = true
+	a.focusAgent()
+	a.handleAgentInputKey("x")
+	a.handleAgentInputKey("<Enter>")
+	if a.mode != modeHelp {
+		t.Fatalf("mode = %v, want help", a.mode)
+	}
+	if !strings.Contains(a.overlay, "ai:") || !strings.Contains(a.overlay, "BARE_EYE_API_KEY") {
+		t.Fatalf("overlay = %q", a.overlay)
+	}
+	if a.agentBusy {
+		t.Fatal("agent must not run without configuration")
+	}
+}
+
+func TestAgentDisabledHidesInput(t *testing.T) {
+	a := newTestApp(t)
+	a.cfg.AI.Enabled = false
+	a.focusAgent()
+	if a.mode != modeHelp {
+		t.Fatalf("mode = %v, want help", a.mode)
+	}
+	if !strings.Contains(a.overlay, "config ai on") {
+		t.Fatalf("overlay = %q", a.overlay)
+	}
+	a.setMode(modeOverview)
+	a.showHelp()
+	if strings.Contains(a.overlay, "agent transcript") {
+		t.Fatalf("help should not list agent keys when disabled:\n%s", a.overlay)
+	}
+	a.cfg.AI.Enabled = true
+	a.showHelp()
+	if !strings.Contains(a.overlay, "agent transcript") {
+		t.Fatalf("help should list agent keys when enabled:\n%s", a.overlay)
+	}
+}
+
+func TestAgentApprovalModalAnswers(t *testing.T) {
+	a := newTestApp(t)
+	res := make(chan bool, 1)
+	a.showAgentApproval(agentApproval{
+		req: agent.Approval{Host: "web-01", Command: "apt-get install -y nginx", Purpose: "install nginx"},
+		res: res,
+	})
+	if a.mode != modeConfirm || a.confirm == nil {
+		t.Fatalf("mode = %v", a.mode)
+	}
+	a.handleConfirmKey("y")
+	select {
+	case ok := <-res:
+		if !ok {
+			t.Fatal("approval = false")
+		}
+	default:
+		t.Fatal("approval was not delivered")
+	}
+}
+
+func TestAgentTranscriptScroll(t *testing.T) {
+	a := newTestApp(t)
+	a.transcript = []string{"one", "two", "three"}
+	a.handleAgentLogKey("<Up>")
+	if a.agentScroll != 1 {
+		t.Fatalf("scroll = %d", a.agentScroll)
+	}
+	a.handleAgentLogKey("<Down>")
+	a.handleAgentLogKey("<Down>")
+	if a.agentScroll != 0 {
+		t.Fatalf("scroll = %d", a.agentScroll)
+	}
+	a.handleAgentLogKey("g")
+	if a.agentScroll != 3 {
+		t.Fatalf("scroll = %d", a.agentScroll)
+	}
+}
+
+func TestAgentResponsePanelShowsLatestReply(t *testing.T) {
+	a := newTestApp(t)
+	a.handleAgentEvent(agent.Event{Kind: agent.EventAssistant, Text: "Saya akan memasang nginx."})
+	if a.lastReply != "Saya akan memasang nginx." {
+		t.Fatalf("lastReply = %q", a.lastReply)
+	}
+	a.updateAgentView()
+	if !strings.Contains(a.agentView.Text, "nginx") {
+		t.Fatalf("panel text = %q", a.agentView.Text)
+	}
+	a.handleAgentEvent(agent.Event{Kind: agent.EventAssistant, Text: "Selesai. Nginx aktif."})
+	a.updateAgentView()
+	if !strings.Contains(a.agentView.Text, "Selesai") {
+		t.Fatalf("panel text = %q", a.agentView.Text)
+	}
+}
+
+func TestAgentApprovalIncludesLastReply(t *testing.T) {
+	a := newTestApp(t)
+	a.lastReply = "Saya akan memasang nginx."
+	res := make(chan bool, 1)
+	a.showAgentApproval(agentApproval{
+		req: agent.Approval{Host: "web-01", Command: "apt-get install -y nginx", Purpose: "install nginx"},
+		res: res,
+	})
+	if a.confirm == nil || !strings.Contains(a.confirm.message, "Saya akan memasang nginx") {
+		t.Fatalf("message = %q", a.confirm.message)
 	}
 }

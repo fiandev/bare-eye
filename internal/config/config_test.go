@@ -60,12 +60,11 @@ func TestValidationErrors(t *testing.T) {
 		return out
 	}
 	cases := map[string]string{
-		"bad port":    base(func(s *ServerConfig) { s.Port = 70000 }),
-		"empty host":  base(func(s *ServerConfig) { s.Host = "" }),
-		"bad id":      base(func(s *ServerConfig) { s.ID = "bad id" }),
-		"empty user":  base(func(s *ServerConfig) { s.User = "" }),
-		"bad auth":    base(func(s *ServerConfig) { s.Auth.Method = "magic" }),
-		"no key path": base(func(s *ServerConfig) { s.Auth.KeyPath = "" }),
+		"bad port":   base(func(s *ServerConfig) { s.Port = 70000 }),
+		"empty host": base(func(s *ServerConfig) { s.Host = "" }),
+		"bad id":     base(func(s *ServerConfig) { s.ID = "bad id" }),
+		"empty user": base(func(s *ServerConfig) { s.User = "" }),
+		"bad auth":   base(func(s *ServerConfig) { s.Auth.Method = "magic" }),
 	}
 	for name, doc := range cases {
 		if _, err := Parse([]byte(doc)); err == nil {
@@ -81,6 +80,28 @@ servers:
 `
 	if _, err := Parse([]byte(dup)); err == nil {
 		t.Error("duplicate ids should fail")
+	}
+}
+
+func TestMissingKeyPathUsesGlobalDefault(t *testing.T) {
+	doc := `
+version: 1
+ssh:
+  default_key: /global/key
+servers:
+  - id: a
+    host: h
+    user: u
+`
+	cfg, err := Parse([]byte(doc))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Servers[0].Auth.Method != AuthKey {
+		t.Errorf("method = %q", cfg.Servers[0].Auth.Method)
+	}
+	if cfg.Servers[0].Auth.KeyPath != "/global/key" {
+		t.Errorf("key path = %q, want global default", cfg.Servers[0].Auth.KeyPath)
 	}
 }
 
@@ -221,6 +242,21 @@ func TestSecretsEncryptedRoundTrip(t *testing.T) {
 	}
 }
 
+func TestValidID(t *testing.T) {
+	valid := []string{"web-01", "203.0.113.10", "db_1", "a"}
+	invalid := []string{"", ":1", "-web", "web 01", "web/01"}
+	for _, id := range valid {
+		if !ValidID(id) {
+			t.Errorf("ValidID(%q) = false, want true", id)
+		}
+	}
+	for _, id := range invalid {
+		if ValidID(id) {
+			t.Errorf("ValidID(%q) = true, want false", id)
+		}
+	}
+}
+
 func TestSlug(t *testing.T) {
 	cases := map[string]string{
 		"Production VPS":    "production-vps",
@@ -267,5 +303,70 @@ func TestExampleConfigParses(t *testing.T) {
 	}
 	if cfg.Monitoring.Thresholds.CPU != 0 {
 		t.Error("thresholds should ship disabled (0)")
+	}
+}
+
+func TestAIDefaultsAndValidation(t *testing.T) {
+	cfg, err := Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AI.Enabled {
+		t.Error("the agent must ship disabled")
+	}
+	if cfg.AI.BaseURL != DefaultAIBaseURL || cfg.AI.Model == "" || cfg.AI.MaxSteps < 1 {
+		t.Errorf("ai defaults = %+v", cfg.AI)
+	}
+	cfg.AI.Enabled = true
+	cfg.AI.BaseURL = "not-a-url"
+	if err := cfg.Validate(); err == nil {
+		t.Error("invalid base_url should fail")
+	}
+	cfg.AI.BaseURL = "https://api.example.com/v1"
+	cfg.AI.Model = "example-model"
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("valid ai config: %v", err)
+	}
+}
+
+func TestAIAPIKeyFromEnvironment(t *testing.T) {
+	t.Setenv("BARE_EYE_API_KEY", "from-bare-eye")
+	cfg, _ := Default()
+	if got := cfg.AI.APIKey(nil); got != "from-bare-eye" {
+		t.Errorf("APIKey = %q", got)
+	}
+	t.Setenv("BARE_EYE_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "from-openai")
+	if got := cfg.AI.APIKey(nil); got != "from-openai" {
+		t.Errorf("fallback APIKey = %q", got)
+	}
+}
+
+func TestAIAPIKeyFromEncryptedStore(t *testing.T) {
+	t.Setenv("BARE_EYE_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	dir := t.TempDir()
+	s, err := LoadSecrets(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetSecret(SecretAIAPIKey, "from-store")
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadSecrets(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := Default()
+	if got := cfg.AI.APIKey(loaded); got != "from-store" {
+		t.Errorf("APIKey = %q", got)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, secretsFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "from-store") {
+		t.Fatal("secrets.enc must not contain the plaintext API key")
 	}
 }

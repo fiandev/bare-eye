@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -63,10 +64,47 @@ type Config struct {
 	Version    int              `yaml:"version"`
 	SSH        SSHConfig        `yaml:"ssh"`
 	Monitoring MonitoringConfig `yaml:"monitoring"`
+	AI         AIConfig         `yaml:"ai,omitempty"`
 	Servers    []ServerConfig   `yaml:"servers"`
 
 	// Extra preserves unknown top-level fields for forward compatibility.
 	Extra map[string]any `yaml:",inline"`
+}
+
+// AIConfig configures the optional LLM automation agent. The API key is never
+// stored in this file; it is read from the environment variable named by
+// APIKeyEnv (or OPENAI_API_KEY as a fallback).
+type AIConfig struct {
+	Enabled        bool     `yaml:"enabled"`
+	BaseURL        string   `yaml:"base_url,omitempty"`
+	Model          string   `yaml:"model,omitempty"`
+	APIKeyEnv      string   `yaml:"api_key_env,omitempty"`
+	Timeout        Duration `yaml:"timeout,omitempty"`
+	CommandTimeout Duration `yaml:"command_timeout,omitempty"`
+	MaxSteps       int      `yaml:"max_steps,omitempty"`
+
+	Extra map[string]any `yaml:",inline"`
+}
+
+// DefaultAIBaseURL is the OpenAI-compatible endpoint used when none is set.
+const DefaultAIBaseURL = "https://api.openai.com/v1"
+
+// APIKey resolves the agent API key. An explicit environment variable wins,
+// then the encrypted secrets store, then OPENAI_API_KEY as a convenience.
+func (a AIConfig) APIKey(secrets *Secrets) string {
+	name := strings.TrimSpace(a.APIKeyEnv)
+	if name == "" {
+		name = "BARE_EYE_API_KEY"
+	}
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		return v
+	}
+	if secrets != nil {
+		if v, ok := secrets.GetSecret(SecretAIAPIKey); ok {
+			return strings.TrimSpace(v)
+		}
+	}
+	return strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
 }
 
 // SSHConfig holds global SSH defaults.
@@ -107,7 +145,7 @@ type AuthConfig struct {
 // ServerConfig is one monitored host.
 type ServerConfig struct {
 	ID             string     `yaml:"id"`
-	Name           string     `yaml:"name"`
+	Name           string     `yaml:"name,omitempty"`
 	Host           string     `yaml:"host"`
 	Port           int        `yaml:"port"`
 	User           string     `yaml:"user"`
@@ -247,6 +285,15 @@ func Default() (*Config, error) {
 			StaleAfter:     Duration(10 * time.Second),
 			MaxConcurrent:  8,
 		},
+		AI: AIConfig{
+			Enabled:        false,
+			BaseURL:        DefaultAIBaseURL,
+			Model:          "gpt-4o-mini",
+			APIKeyEnv:      "BARE_EYE_API_KEY",
+			Timeout:        Duration(90 * time.Second),
+			CommandTimeout: Duration(2 * time.Minute),
+			MaxSteps:       12,
+		},
 		Servers: []ServerConfig{},
 	}, nil
 }
@@ -338,6 +385,24 @@ func (c *Config) normalize() error {
 	if c.Monitoring.MaxConcurrent <= 0 {
 		c.Monitoring.MaxConcurrent = def.Monitoring.MaxConcurrent
 	}
+	if strings.TrimSpace(c.AI.BaseURL) == "" {
+		c.AI.BaseURL = def.AI.BaseURL
+	}
+	if strings.TrimSpace(c.AI.Model) == "" {
+		c.AI.Model = def.AI.Model
+	}
+	if strings.TrimSpace(c.AI.APIKeyEnv) == "" {
+		c.AI.APIKeyEnv = def.AI.APIKeyEnv
+	}
+	if c.AI.Timeout <= 0 {
+		c.AI.Timeout = def.AI.Timeout
+	}
+	if c.AI.CommandTimeout <= 0 {
+		c.AI.CommandTimeout = def.AI.CommandTimeout
+	}
+	if c.AI.MaxSteps <= 0 {
+		c.AI.MaxSteps = def.AI.MaxSteps
+	}
 	if strings.TrimSpace(c.SSH.DefaultKey) == "" {
 		c.SSH.DefaultKey = def.SSH.DefaultKey
 	}
@@ -367,6 +432,9 @@ func (c *Config) normalize() error {
 		*p = expanded
 	}
 	for i := range c.Servers {
+		if c.Servers[i].Auth.Method == AuthKey && strings.TrimSpace(c.Servers[i].Auth.KeyPath) == "" {
+			c.Servers[i].Auth.KeyPath = c.SSH.DefaultKey
+		}
 		if c.Servers[i].Auth.KeyPath != "" {
 			expanded, err := expandPath(c.Servers[i].Auth.KeyPath)
 			if err != nil {
@@ -404,6 +472,9 @@ func (c *Config) Validate() error {
 	if err := validateThresholds(c.Monitoring.Thresholds); err != nil {
 		return err
 	}
+	if err := c.AI.Validate(); err != nil {
+		return err
+	}
 	seen := make(map[string]bool, len(c.Servers))
 	for i, s := range c.Servers {
 		if err := s.Validate(); err != nil {
@@ -418,6 +489,9 @@ func (c *Config) Validate() error {
 }
 
 var idPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// ValidID reports whether an ID satisfies the server ID pattern.
+func ValidID(id string) bool { return idPattern.MatchString(id) }
 
 // Validate checks one server entry.
 func (s ServerConfig) Validate() error {
@@ -459,6 +533,30 @@ func (s ServerConfig) Validate() error {
 		if d != 0 && (d.Duration() < 100*time.Millisecond || d.Duration() > 10*time.Minute) {
 			return fmt.Errorf("%s must be between 100ms and 10m", name)
 		}
+	}
+	return nil
+}
+
+// Validate checks the optional AI automation settings.
+func (a AIConfig) Validate() error {
+	if !a.Enabled {
+		return nil
+	}
+	u, err := url.Parse(strings.TrimSpace(a.BaseURL))
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("ai.base_url must be an http(s) URL")
+	}
+	if strings.TrimSpace(a.Model) == "" {
+		return fmt.Errorf("ai.model is required when ai.enabled is true")
+	}
+	if a.Timeout.Duration() < time.Second || a.Timeout.Duration() > 10*time.Minute {
+		return fmt.Errorf("ai.timeout must be between 1s and 10m")
+	}
+	if a.CommandTimeout.Duration() < time.Second || a.CommandTimeout.Duration() > 30*time.Minute {
+		return fmt.Errorf("ai.command_timeout must be between 1s and 30m")
+	}
+	if a.MaxSteps < 1 || a.MaxSteps > 50 {
+		return fmt.Errorf("ai.max_steps must be between 1 and 50")
 	}
 	return nil
 }

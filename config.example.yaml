@@ -25,6 +25,18 @@ monitoring:
     swap: 0
     disk: 0
 
+ai:
+  # Optional LLM automation agent (OpenAI-compatible chat completions).
+  # Store the API key with `bare-eye config set api-key` (encrypted at rest).
+  # The environment variable below overrides the stored key when set.
+  enabled: false
+  base_url: https://api.openai.com/v1
+  model: gpt-4o-mini
+  api_key_env: BARE_EYE_API_KEY
+  timeout: 90s
+  command_timeout: 2m
+  max_steps: 12
+
 servers:
   - id: prod-01
     name: Production VPS
