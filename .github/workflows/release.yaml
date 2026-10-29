@@ -15,6 +15,13 @@ concurrency:
 env:
   BINARY: bare-eye
   COPR_PROJECT: bare-eye
+  # Chroots the COPR project is created with (only used when it does not exist).
+  COPR_CHROOTS: >-
+    fedora-43-x86_64
+    fedora-43-aarch64
+    fedora-44-x86_64
+    fedora-44-aarch64
+    fedora-rawhide-x86_64
 
 jobs:
   test:
@@ -40,7 +47,7 @@ jobs:
         run: go test -race ./...
 
   build:
-    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}
     needs: test
     runs-on: ubuntu-latest
     strategy:
@@ -51,9 +58,37 @@ jobs:
             goarch: amd64
           - goos: linux
             goarch: arm64
+          - goos: linux
+            goarch: arm
+            goarm: "6"
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+          - goos: linux
+            goarch: "386"
+          - goos: linux
+            goarch: ppc64le
+          - goos: linux
+            goarch: s390x
+          - goos: linux
+            goarch: riscv64
+          - goos: linux
+            goarch: loong64
           - goos: darwin
             goarch: amd64
           - goos: darwin
+            goarch: arm64
+          - goos: freebsd
+            goarch: amd64
+          - goos: freebsd
+            goarch: arm64
+          - goos: openbsd
+            goarch: amd64
+          - goos: netbsd
+            goarch: amd64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
             goarch: arm64
     steps:
       - name: Checkout
@@ -67,17 +102,33 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Resolve arch name
+        env:
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          set -euo pipefail
+          case "${GOARCH}" in
+            amd64) arch="x86_64" ;;
+            386)   arch="i386" ;;
+            arm)   arch="armv${GOARM}" ;;
+            arm64) arch="aarch64" ;;
+            *)     arch="${GOARCH}" ;;
+          esac
+          echo "ARCH=${arch}" >> "${GITHUB_ENV}"
+
       - name: Build
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
           CGO_ENABLED: "0"
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           commit="${GITHUB_SHA::12}"
           date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          name="${BINARY}_${version}_${GOOS}_${GOARCH}"
+          name="${BINARY}_${version}_${GOOS}_${ARCH}"
           mkdir -p "dist/${name}"
 
           go build -trimpath \
@@ -93,7 +144,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.BINARY }}_${{ matrix.goos }}_${{ matrix.goarch }}
+          name: ${{ env.BINARY }}_${{ matrix.goos }}_${{ env.ARCH }}
           path: dist/*.tar.gz
           if-no-files-found: error
 
@@ -119,13 +170,26 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/SHA256SUMS \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "${GITHUB_REF_NAME}" \
-            --verify-tag \
-            --generate-notes
+          assets=(dist/*.tar.gz dist/SHA256SUMS)
+
+          # Safe to re-run: a previous run may have already published the
+          # release (or created it as a draft), so refresh assets instead of
+          # failing on "release already exists".
+          if gh release view "${TAG}" --repo "${REPO}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; updating assets"
+            gh release upload "${TAG}" "${assets[@]}" --repo "${REPO}" --clobber
+          else
+            gh release create "${TAG}" "${assets[@]}" \
+              --repo "${REPO}" \
+              --title "${TAG}" \
+              --verify-tag \
+              --generate-notes ||
+              gh release upload "${TAG}" "${assets[@]}" --repo "${REPO}" --clobber
+          fi
 
   copr:
     name: Publish to COPR
@@ -169,6 +233,25 @@ jobs:
           mkdir -p "$HOME/.config"
           printf '%s\n' "${COPR_CONFIG}" > "$HOME/.config/copr"
           chmod 600 "$HOME/.config/copr"
+
+      # The workflow used to assume the COPR project already existed, which
+      # failed with "Project <owner>/bare-eye does not exist" on the first tag.
+      - name: Ensure COPR project exists
+        run: |
+          set -euo pipefail
+          if copr-cli get "${COPR_PROJECT}" >/dev/null 2>&1; then
+            echo "COPR project ${COPR_PROJECT} already exists"
+            exit 0
+          fi
+
+          chroot_args=()
+          for chroot in ${COPR_CHROOTS}; do
+            chroot_args+=(--chroot "${chroot}")
+          done
+
+          echo "Creating COPR project ${COPR_PROJECT}"
+          copr-cli create "${COPR_PROJECT}" "${chroot_args[@]}" \
+            --description "Terminal dashboard for monitoring Linux servers over SSH"
 
       - name: Build source RPM
         run: |
