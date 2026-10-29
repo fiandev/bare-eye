@@ -1,0 +1,6 @@
+/bare-eye
+/screenshot.png
+*.test
+*.out
+.DS_Store
+bin

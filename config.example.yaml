@@ -1,0 +1,59 @@
+# Bare Eye configuration example.
+# Copy to ~/.config/bare-eye/config.yaml or run `bare-eye init`.
+# This file never contains passwords.
+
+version: 1
+
+ssh:
+  # Dedicated Bare Eye key. Prefer this over ~/.ssh/id_*.
+  default_key: ~/.config/bare-eye/keys/bare-eye-ed25519
+  # Bare Eye manages its own host-key file (strict verification).
+  known_hosts: ~/.config/bare-eye/known_hosts
+  # Optional default SSH user for new hosts.
+  default_user: monitor
+
+monitoring:
+  interval: 2s
+  connect_timeout: 5s
+  command_timeout: 5s
+  stale_after: 10s
+  max_concurrent: 8
+  # Percentages. 0 disables a threshold (the default).
+  thresholds:
+    cpu: 0
+    mem: 0
+    swap: 0
+    disk: 0
+
+servers:
+  - id: prod-01
+    name: Production VPS
+    host: 203.0.113.10
+    port: 22
+    user: monitor
+    auth:
+      method: key
+      key_path: ~/.config/bare-eye/keys/bare-eye-ed25519
+    enabled: true
+    tags: [prod, web]
+
+  - id: db-01
+    name: Database
+    host: 203.0.113.11
+    port: 2222
+    user: admin
+    auth:
+      method: password        # password is stored via `bare-eye config set password db-01`
+    enabled: true
+    interval: 5s              # per-host override
+    connect_timeout: 8s
+    command_timeout: 8s
+
+  - id: lab-01
+    name: Lab box
+    host: lab.example.com
+    port: 22
+    user: root
+    auth:
+      method: agent           # uses SSH_AUTH_SOCK
+    enabled: false
