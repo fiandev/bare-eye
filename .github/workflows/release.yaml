@@ -253,6 +253,83 @@ jobs:
           copr-cli create "${COPR_PROJECT}" "${chroot_args[@]}" \
             --description "Terminal dashboard for monitoring Linux servers over SSH"
 
+      # A newly created project (and sometimes an existing one) has no DNF repo
+      # metadata yet. Without `repodata/repomd.xml` the COPR build job waits for
+      # the `copr_base` repository for ~10 minutes and then fails, so regenerate
+      # the repos unconditionally before submitting anything.
+      - name: Regenerate COPR repo metadata
+        run: |
+          set -euo pipefail
+          if ! output="$(copr-cli regenerate-repos "${COPR_PROJECT}" 2>&1)"; then
+            # Non-zero here usually just means a regeneration is already queued
+            # for the project; the wait step below still validates the outcome.
+            echo "::warning::copr-cli regenerate-repos exited non-zero; assuming a regeneration is already running"
+            printf '%s\n' "${output}"
+          else
+            printf '%s\n' "${output}"
+          fi
+
+      # copr-cli has no `get-json` subcommand, so read the project from the
+      # public API v3. Only chroots the project actually has can be polled;
+      # entries in COPR_CHROOTS that are not enabled are skipped with a warning
+      # (enabling them is a separate change).
+      - name: Wait for COPR repo metadata
+        run: |
+          set -euo pipefail
+
+          owner="$(awk -F= '/^[[:space:]]*username[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' "$HOME/.config/copr")"
+          if [ -z "${owner}" ]; then
+            echo "::error::could not read username from $HOME/.config/copr"
+            exit 1
+          fi
+
+          api_url="https://copr.fedorainfracloud.org/api_3/project?ownername=${owner}&projectname=${COPR_PROJECT}"
+          echo "Querying COPR API: ${api_url}"
+          if ! project_json="$(curl -fsS --retry 3 --retry-delay 2 "${api_url}")"; then
+            echo "::error::failed to query COPR API: ${api_url}"
+            exit 1
+          fi
+
+          if ! chroot_map="$(printf '%s' "${project_json}" | python3 -c 'import json, sys; repos = json.load(sys.stdin).get("chroot_repos") or {}; [print(f"{k}\t{v}") for k, v in sorted(repos.items())]')"; then
+            echo "::error::failed to parse chroot_repos from COPR API response"
+            exit 1
+          fi
+          if [ -z "${chroot_map}" ]; then
+            echo "::error::COPR project ${COPR_PROJECT} reports no enabled chroots"
+            exit 1
+          fi
+
+          enabled_chroots=()
+          declare -A repo_urls=()
+          while IFS=$'\t' read -r chroot repo_url; do
+            enabled_chroots+=("${chroot}")
+            repo_urls["${chroot}"]="${repo_url}"
+          done <<< "${chroot_map}"
+
+          for chroot in ${COPR_CHROOTS}; do
+            if [ -z "${repo_urls[${chroot}]:-}" ]; then
+              echo "::warning::COPR chroot ${chroot} is not enabled on project ${COPR_PROJECT}; skipping metadata wait"
+            fi
+          done
+
+          for chroot in "${enabled_chroots[@]}"; do
+            url="${repo_urls[${chroot}]%/}/repodata/repomd.xml"
+            published=false
+            for attempt in $(seq 1 30); do
+              if curl -fsS -o /dev/null "${url}"; then
+                echo "repomd.xml available for ${chroot} (attempt ${attempt}/30)"
+                published=true
+                break
+              fi
+              echo "Waiting for ${chroot} repo metadata (attempt ${attempt}/30): ${url}"
+              sleep 10
+            done
+            if [ "${published}" != true ]; then
+              echo "::error::COPR repo metadata never appeared for ${chroot}: ${url}"
+              exit 1
+            fi
+          done
+
       - name: Build source RPM
         run: |
           set -euo pipefail
